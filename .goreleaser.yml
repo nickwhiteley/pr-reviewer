@@ -1,0 +1,47 @@
+version: 2
+
+project_name: pr-reviewer
+
+builds:
+  - id: pr-reviewer
+    main: ./cmd/review
+    binary: pr-reviewer
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    env:
+      - CGO_ENABLED=0
+
+archives:
+  - id: pr-reviewer
+    ids:
+      - pr-reviewer
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: "pr-reviewer_{{ .Os }}_{{ .Arch }}"
+    files:
+      - none*
+
+checksum:
+  name_template: "pr-reviewer_checksums.txt"
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ .Tag }}-next"
+
+release:
+  github:
+    owner: nickwhiteley
+    name: pr-reviewer
