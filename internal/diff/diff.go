@@ -20,6 +20,8 @@ var exclusions = []string{
 	"dist/",
 	"*.gen.go",
 	"*.pb.go",
+	"PR-REVIEW.md",
+	"CLAUDE.md",
 }
 
 const maxDiffSize = 100 * 1024 // 100KB
