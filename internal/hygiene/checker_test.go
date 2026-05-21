@@ -80,7 +80,7 @@ func TestRunner_noTickedItems(t *testing.T) {
 func TestRunner_H005_pass(t *testing.T) {
 	summary := "github.com/foo/bar.go:10:\tFoo\t100.0%\ntotal:\t\t\t(statements)\t97.3%"
 	runner := NewRunner(summary)
-	results := runner.Run(context.Background(), []Check{{ID: "H005", Name: "Coverage", Ticked: true}})
+	results := runner.Run(context.Background(), []Check{{ID: "H005", Name: "Test coverage is above 95%", Ticked: true}})
 	if len(results) != 1 || !results[0].Passed {
 		t.Errorf("expected H005 to pass, got %+v", results[0])
 	}
@@ -89,15 +89,35 @@ func TestRunner_H005_pass(t *testing.T) {
 func TestRunner_H005_fail_below_threshold(t *testing.T) {
 	summary := "github.com/foo/bar.go:10:\tFoo\t80.0%\ntotal:\t\t\t(statements)\t82.1%"
 	runner := NewRunner(summary)
-	results := runner.Run(context.Background(), []Check{{ID: "H005", Name: "Coverage", Ticked: true}})
+	results := runner.Run(context.Background(), []Check{{ID: "H005", Name: "Test coverage is above 95%", Ticked: true}})
 	if len(results) != 1 || results[0].Passed {
 		t.Errorf("expected H005 to fail, got %+v", results[0])
 	}
 }
 
+func TestRunner_H005_custom_threshold(t *testing.T) {
+	summary := "total:\t\t\t(statements)\t85.0%"
+	runner := NewRunner(summary)
+	// 80% threshold extracted from name — 85% should pass
+	results := runner.Run(context.Background(), []Check{{ID: "H005", Name: "Test coverage is above 80%", Ticked: true}})
+	if len(results) != 1 || !results[0].Passed {
+		t.Errorf("expected H005 to pass with 80%% threshold, got %+v", results[0])
+	}
+}
+
+func TestRunner_H005_default_threshold_fallback(t *testing.T) {
+	summary := "total:\t\t\t(statements)\t94.0%"
+	runner := NewRunner(summary)
+	// No % in name — falls back to 95%, so 94% should fail
+	results := runner.Run(context.Background(), []Check{{ID: "H005", Name: "Test coverage check", Ticked: true}})
+	if len(results) != 1 || results[0].Passed {
+		t.Errorf("expected H005 to fail with default 95%% threshold, got %+v", results[0])
+	}
+}
+
 func TestRunner_H005_fail_no_summary(t *testing.T) {
 	runner := NewRunner("")
-	results := runner.Run(context.Background(), []Check{{ID: "H005", Name: "Coverage", Ticked: true}})
+	results := runner.Run(context.Background(), []Check{{ID: "H005", Name: "Test coverage is above 95%", Ticked: true}})
 	if len(results) != 1 || results[0].Passed {
 		t.Errorf("expected H005 to fail with no summary, got %+v", results[0])
 	}

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -69,10 +70,21 @@ func (r *Runner) runOne(ctx context.Context, c Check) Result {
 	}
 }
 
-const coverageThreshold = 95.0
+var pctPattern = regexp.MustCompile(`(\d+(?:\.\d+)?)%`)
 
-// checkCoverage parses `go tool cover -func` output and checks the total is >= 95%.
+const defaultCoverageThreshold = 95.0
+
+// checkCoverage parses `go tool cover -func` output and checks the total meets
+// the threshold extracted from the rule name (e.g. "above 80%"). Falls back to
+// 95% if no percentage is found in the name.
 func (r *Runner) checkCoverage(c Check) Result {
+	threshold := defaultCoverageThreshold
+	if m := pctPattern.FindStringSubmatch(c.Name); m != nil {
+		if v, err := strconv.ParseFloat(m[1], 64); err == nil {
+			threshold = v
+		}
+	}
+
 	if r.coverageSummary == "" {
 		return Result{ID: c.ID, Name: c.Name, Passed: false, Details: "no coverage report provided — run CI with --coverage-file"}
 	}
@@ -88,10 +100,10 @@ func (r *Runner) checkCoverage(c Check) Result {
 		if err != nil {
 			return Result{ID: c.ID, Name: c.Name, Passed: false, Details: fmt.Sprintf("could not parse coverage total: %v", err)}
 		}
-		if pct >= coverageThreshold {
-			return Result{ID: c.ID, Name: c.Name, Passed: true, Details: fmt.Sprintf("%.1f%% (threshold %.0f%%)", pct, coverageThreshold)}
+		if pct >= threshold {
+			return Result{ID: c.ID, Name: c.Name, Passed: true, Details: fmt.Sprintf("%.1f%% (threshold %.0f%%)", pct, threshold)}
 		}
-		return Result{ID: c.ID, Name: c.Name, Passed: false, Details: fmt.Sprintf("%.1f%% is below %.0f%% threshold", pct, coverageThreshold)}
+		return Result{ID: c.ID, Name: c.Name, Passed: false, Details: fmt.Sprintf("%.1f%% is below %.0f%% threshold", pct, threshold)}
 	}
 	return Result{ID: c.ID, Name: c.Name, Passed: false, Details: "no total line found in coverage report"}
 }
