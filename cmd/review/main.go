@@ -73,7 +73,7 @@ func main() {
 	gh := github.NewClient(*repo)
 
 	// Run hygiene checks
-	runner := hygiene.NewRunner()
+	runner := hygiene.NewRunner(coverageSummary)
 	var hygieneChecks []hygiene.Check
 	for _, h := range cfg.Hygiene {
 		hygieneChecks = append(hygieneChecks, hygiene.Check{

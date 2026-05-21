@@ -43,7 +43,7 @@ Low
 		t.Fatalf("parse failed: %v", err)
 	}
 
-	runner := hygiene.NewRunner()
+	runner := hygiene.NewRunner("")
 	var checks []hygiene.Check
 	for _, h := range cfg.Hygiene {
 		checks = append(checks, hygiene.Check{

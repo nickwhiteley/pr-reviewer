@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -19,11 +20,13 @@ type Result struct {
 }
 
 // Runner executes ticked hygiene checks.
-type Runner struct{}
+type Runner struct {
+	coverageSummary string
+}
 
 // NewRunner creates a new hygiene runner.
-func NewRunner() *Runner {
-	return &Runner{}
+func NewRunner(coverageSummary string) *Runner {
+	return &Runner{coverageSummary: coverageSummary}
 }
 
 // Run executes the given checks and returns results.
@@ -54,6 +57,8 @@ func (r *Runner) runOne(ctx context.Context, c Check) Result {
 		return checkFileExists(c, ".github/CODEOWNERS")
 	case "H003":
 		return r.checkDependencies(ctx, c)
+	case "H005":
+		return r.checkCoverage(c)
 	case "H006":
 		if path, ok := findUpward(".devcontainer/devcontainer.json"); ok {
 			return Result{ID: c.ID, Name: c.Name, Passed: true, Details: path + " exists"}
@@ -62,6 +67,33 @@ func (r *Runner) runOne(ctx context.Context, c Check) Result {
 	default:
 		return Result{ID: c.ID, Name: c.Name, Passed: false, Details: "unknown check ID"}
 	}
+}
+
+const coverageThreshold = 95.0
+
+// checkCoverage parses `go tool cover -func` output and checks the total is >= 95%.
+func (r *Runner) checkCoverage(c Check) Result {
+	if r.coverageSummary == "" {
+		return Result{ID: c.ID, Name: c.Name, Passed: false, Details: "no coverage report provided — run CI with --coverage-file"}
+	}
+	for _, line := range strings.Split(r.coverageSummary, "\n") {
+		if !strings.HasPrefix(line, "total:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			break
+		}
+		pct, err := strconv.ParseFloat(strings.TrimSuffix(fields[len(fields)-1], "%"), 64)
+		if err != nil {
+			return Result{ID: c.ID, Name: c.Name, Passed: false, Details: fmt.Sprintf("could not parse coverage total: %v", err)}
+		}
+		if pct >= coverageThreshold {
+			return Result{ID: c.ID, Name: c.Name, Passed: true, Details: fmt.Sprintf("%.1f%% (threshold %.0f%%)", pct, coverageThreshold)}
+		}
+		return Result{ID: c.ID, Name: c.Name, Passed: false, Details: fmt.Sprintf("%.1f%% is below %.0f%% threshold", pct, coverageThreshold)}
+	}
+	return Result{ID: c.ID, Name: c.Name, Passed: false, Details: "no total line found in coverage report"}
 }
 
 func checkFileExists(c Check, path string) Result {
