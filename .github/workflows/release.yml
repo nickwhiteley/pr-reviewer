@@ -24,6 +24,9 @@ jobs:
           default_bump: patch
           release_branches: main
 
+      - name: Fetch new tag
+        run: git fetch --tags
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -36,3 +39,4 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: ${{ steps.tag.outputs.new_tag }}
