@@ -4,6 +4,7 @@ package hygiene
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -115,21 +116,63 @@ func checkFileExists(c Check, path string) Result {
 	return Result{ID: c.ID, Name: c.Name, Passed: true, Details: fmt.Sprintf("%s exists", path)}
 }
 
-func (r *Runner) checkDependencies(ctx context.Context, c Check) Result {
-	if _, err := os.Stat("go.mod"); err == nil {
-		return r.checkGoDeps(ctx, c)
-	}
-	if _, err := os.Stat("package.json"); err == nil {
-		return r.checkNodeDeps(ctx, c)
-	}
-	return Result{ID: c.ID, Name: c.Name, Passed: false, Details: "no go.mod or package.json found"}
+// skipDirs are directory names that are never descended into during dependency walks.
+var skipDirs = map[string]bool{
+	"node_modules": true,
+	"vendor":       true,
+	".git":         true,
 }
 
-func (r *Runner) checkGoDeps(ctx context.Context, c Check) Result {
+func (r *Runner) checkDependencies(ctx context.Context, c Check) Result {
+	var goModDirs, pkgJSONDirs []string
+
+	_ = filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if skipDirs[d.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		switch d.Name() {
+		case "go.mod":
+			goModDirs = append(goModDirs, filepath.Dir(path))
+		case "package.json":
+			pkgJSONDirs = append(pkgJSONDirs, filepath.Dir(path))
+		}
+		return nil
+	})
+
+	if len(goModDirs) == 0 && len(pkgJSONDirs) == 0 {
+		return Result{ID: c.ID, Name: c.Name, Passed: false, Details: "no go.mod or package.json found in repository"}
+	}
+
+	var failures []string
+	for _, dir := range goModDirs {
+		if res := r.checkGoDepsInDir(ctx, c, dir); !res.Passed {
+			failures = append(failures, res.Details)
+		}
+	}
+	for _, dir := range pkgJSONDirs {
+		if res := r.checkNodeDepsInDir(ctx, c, dir); !res.Passed {
+			failures = append(failures, res.Details)
+		}
+	}
+
+	if len(failures) > 0 {
+		return Result{ID: c.ID, Name: c.Name, Passed: false, Details: strings.Join(failures, "; ")}
+	}
+	return Result{ID: c.ID, Name: c.Name, Passed: true, Details: "all dependencies up to date"}
+}
+
+func (r *Runner) checkGoDepsInDir(ctx context.Context, c Check, dir string) Result {
 	cmd := exec.CommandContext(ctx, "go", "list", "-u", "-m", "all")
+	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {
-		return Result{ID: c.ID, Name: c.Name, Passed: false, Details: fmt.Sprintf("go list failed: %v", err)}
+		return Result{ID: c.ID, Name: c.Name, Passed: false, Details: fmt.Sprintf("%s: go list failed: %v", dir, err)}
 	}
 
 	var outdated []string
@@ -152,38 +195,37 @@ func (r *Runner) checkGoDeps(ctx context.Context, c Check) Result {
 			ID:      c.ID,
 			Name:    c.Name,
 			Passed:  false,
-			Details: fmt.Sprintf("%d outdated Go modules: %s", len(outdated), strings.Join(outdated, ", ")),
+			Details: fmt.Sprintf("%s: %d outdated Go modules: %s", dir, len(outdated), strings.Join(outdated, ", ")),
 		}
 	}
-	return Result{ID: c.ID, Name: c.Name, Passed: true, Details: "all Go modules up to date"}
+	return Result{ID: c.ID, Name: c.Name, Passed: true, Details: fmt.Sprintf("%s: all Go modules up to date", dir)}
 }
 
-func (r *Runner) checkNodeDeps(ctx context.Context, c Check) Result {
+func (r *Runner) checkNodeDepsInDir(ctx context.Context, c Check, dir string) Result {
 	cmd := exec.CommandContext(ctx, "npm", "outdated", "--json")
-	cmd.Dir = "."
+	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {
-		// npm outdated exits 1 when there are outdated packages
+		// npm outdated exits 1 when there are outdated packages; stdout has the JSON, stderr has errors
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			out = exitErr.Stderr
+			if len(out) == 0 {
+				out = exitErr.Stderr
+			}
 		} else {
-			return Result{ID: c.ID, Name: c.Name, Passed: false, Details: fmt.Sprintf("npm outdated failed: %v", err)}
+			return Result{ID: c.ID, Name: c.Name, Passed: false, Details: fmt.Sprintf("%s: npm outdated failed: %v", dir, err)}
 		}
 	}
 
 	if len(out) == 0 || strings.TrimSpace(string(out)) == "{}" {
-		return Result{ID: c.ID, Name: c.Name, Passed: true, Details: "all npm packages up to date"}
+		return Result{ID: c.ID, Name: c.Name, Passed: true, Details: fmt.Sprintf("%s: all npm packages up to date", dir)}
 	}
 
-	// Parse JSON output to count outdated packages
-	lines := strings.Split(string(out), "\n")
 	var outdated []string
-	for _, line := range lines {
+	for _, line := range strings.Split(string(out), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || line == "{" || line == "}" {
 			continue
 		}
-		// Each outdated package line starts with "  \"package\": {"
 		if strings.HasPrefix(line, "\"") {
 			name := strings.Split(line, "\"")[1]
 			outdated = append(outdated, name)
@@ -195,10 +237,10 @@ func (r *Runner) checkNodeDeps(ctx context.Context, c Check) Result {
 			ID:      c.ID,
 			Name:    c.Name,
 			Passed:  false,
-			Details: fmt.Sprintf("%d outdated npm packages: %s", len(outdated), strings.Join(outdated, ", ")),
+			Details: fmt.Sprintf("%s: %d outdated npm packages: %s", dir, len(outdated), strings.Join(outdated, ", ")),
 		}
 	}
-	return Result{ID: c.ID, Name: c.Name, Passed: true, Details: "all npm packages up to date"}
+	return Result{ID: c.ID, Name: c.Name, Passed: true, Details: fmt.Sprintf("%s: all npm packages up to date", dir)}
 }
 
 // FormatReport returns a markdown report from results.
