@@ -17,9 +17,13 @@ var exclusions = []string{
 	"vendor/",
 	"node_modules/",
 	"*.lock",
+	"package-lock.json",
+	"pnpm-lock.yaml",
+	"yarn.lock",
 	"dist/",
 	"*.gen.go",
 	"*.pb.go",
+	"go.sum",
 	"PR-REVIEW.md",
 	"CLAUDE.md",
 }

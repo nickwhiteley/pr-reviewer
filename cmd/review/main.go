@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/nickwhiteley/pr-reviewer/internal/config"
 	"github.com/nickwhiteley/pr-reviewer/internal/diff"
@@ -19,15 +21,17 @@ import (
 
 func main() {
 	var (
-		prNum        = flag.Int("pr", 0, "Pull request number")
-		repo         = flag.String("repo", "", "Repository in owner/name format")
-		base         = flag.String("base", "", "Base commit SHA")
-		head         = flag.String("head", "", "Head commit SHA")
-		model        = flag.String("model", "kimi-k2.6:cloud", "Ollama model to use")
-		debug        = flag.Bool("debug", false, "Enable debug logging")
-		configPath   = flag.String("config", "PR-REVIEW.md", "Path to PR-REVIEW.md")
-		skipAgents   = flag.Bool("skip-agents", false, "Skip AI agent reviews (hygiene only)")
-		coverageFile = flag.String("coverage-file", "", "Path to go tool cover -func output to include in agent prompts")
+		prNum         = flag.Int("pr", 0, "Pull request number")
+		repo          = flag.String("repo", "", "Repository in owner/name format")
+		base          = flag.String("base", "", "Base commit SHA")
+		head          = flag.String("head", "", "Head commit SHA")
+		model         = flag.String("model", "", "AI model to use (default: provider-specific)")
+		debug         = flag.Bool("debug", false, "Enable debug logging")
+		configPath    = flag.String("config", "PR-REVIEW.md", "Path to PR-REVIEW.md")
+		skipAgents    = flag.Bool("skip-agents", false, "Skip AI agent reviews (hygiene only)")
+		coverageFile  = flag.String("coverage-file", "", "Path to go tool cover -func output to include in agent prompts")
+		providerName  = flag.String("provider", "ollama", "AI provider: ollama or anthropic")
+		reviewTimeout = flag.Int("review-timeout", 600, "Timeout in seconds for the AI review phase (0 = no timeout)")
 	)
 	flag.Parse()
 
@@ -40,6 +44,27 @@ func main() {
 
 	if *prNum == 0 || *repo == "" || *base == "" || *head == "" {
 		slog.Error("missing required flags", "pr", *prNum, "repo", *repo, "base", *base, "head", *head)
+		os.Exit(1)
+	}
+
+	// Resolve default model per provider.
+	if *model == "" {
+		switch *providerName {
+		case "anthropic":
+			*model = "claude-sonnet-4-6"
+		default:
+			*model = "kimi-k2.6:cloud"
+		}
+	}
+
+	var p provider.Provider
+	switch *providerName {
+	case "anthropic":
+		p = provider.NewAnthropicProvider()
+	case "ollama":
+		p = provider.NewOllamaProvider()
+	default:
+		slog.Error("unknown provider", "provider", *providerName)
 		os.Exit(1)
 	}
 
@@ -110,11 +135,19 @@ func main() {
 		}
 	}
 
+	// Build a context with a timeout for the AI review phase.
+	// On expiry we post a PR comment and exit 0 rather than failing the pipeline.
+	var reviewCtx context.Context
+	var reviewCancel context.CancelFunc
+	if *reviewTimeout > 0 {
+		reviewCtx, reviewCancel = context.WithTimeout(ctx, time.Duration(*reviewTimeout)*time.Second)
+	} else {
+		reviewCtx, reviewCancel = context.WithCancel(ctx)
+	}
+	defer reviewCancel()
+
 	// Run code review agents in parallel.
 	// Each agent is independent — a failure in one does not cancel the others.
-	// We create a fresh OllamaProvider per agent so that transport-level
-	// timeouts and connection state are fully isolated.
-
 	var (
 		wg                sync.WaitGroup
 		mu                sync.Mutex
@@ -127,13 +160,20 @@ func main() {
 		go func(agent config.AgentConfig) {
 			defer wg.Done()
 
-			ollama := provider.NewOllamaProvider()
-			slog.Info("running agent", "subagent", agent.Subagent, "chunks", len(diffChunks))
-			combinedSummary, combinedText, err := runAgentChunks(ctx, ollama, *model, cfg, agent, diffChunks, coverageSummary)
+			slog.Info("running agent", "subagent", agent.Subagent, "chunks", len(diffChunks), "provider", *providerName, "model", *model)
+			combinedSummary, combinedText, err := runAgentChunks(reviewCtx, p, *model, cfg, agent, diffChunks, coverageSummary)
 			if err != nil {
+				// If the review context expired, suppress individual failure comments —
+				// a single timeout comment will be posted after all goroutines finish.
+				if reviewCtx.Err() != nil {
+					mu.Lock()
+					failedAgents++
+					mu.Unlock()
+					return
+				}
+
 				slog.Error("agent failed", "subagent", agent.Subagent, "error", err)
 
-				// Post a failure comment so the PR shows which agent did not finish.
 				failureReport := review.FormatAgentFailureReport(agent, err)
 				marker := fmt.Sprintf("<!-- wd-auto-review:agent=%s -->", agent.Subagent)
 				if postErr := gh.PostOrUpdate(ctx, *prNum, marker, failureReport); postErr != nil {
@@ -163,6 +203,16 @@ func main() {
 
 	wg.Wait()
 
+	// If the review timed out, post a single comment and exit successfully.
+	if errors.Is(reviewCtx.Err(), context.DeadlineExceeded) {
+		timeoutReport := formatTimeoutReport(*reviewTimeout, *providerName)
+		if postErr := gh.PostOrUpdate(ctx, *prNum, "<!-- wd-auto-review:type=timeout -->", timeoutReport); postErr != nil {
+			slog.Error("failed to post timeout comment", "error", postErr)
+		}
+		slog.Info("review timed out — exiting 0", "timeout_seconds", *reviewTimeout)
+		return
+	}
+
 	if failedAgents > 0 {
 		slog.Info("review complete with agent failures", "failed", failedAgents)
 	}
@@ -174,9 +224,21 @@ func main() {
 	slog.Info("review complete")
 }
 
+// formatTimeoutReport returns a PR comment body explaining that the review timed out.
+func formatTimeoutReport(timeoutSecs int, providerName string) string {
+	return fmt.Sprintf(`## ⏱ PR Review — Agent Timeout
+
+The AI review agents did not complete within the configured timeout (%ds via the **%s** provider).
+
+This is **not a CI failure** — your other checks have passed. The code changes may still require manual review.
+
+**To retry:** re-run the *PR Review* workflow job from the GitHub Actions tab.
+`, timeoutSecs, providerName)
+}
+
 // runAgentChunks processes all diff chunks for a single agent and combines results.
 // Chunks are processed sequentially within an agent to avoid overwhelming the provider.
-func runAgentChunks(ctx context.Context, ollama *provider.OllamaProvider, model string, cfg *config.Config, agent config.AgentConfig, diffChunks []string, coverageSummary string) (review.SeveritySummary, string, error) {
+func runAgentChunks(ctx context.Context, p provider.Provider, model string, cfg *config.Config, agent config.AgentConfig, diffChunks []string, coverageSummary string) (review.SeveritySummary, string, error) {
 	var combined review.SeveritySummary
 	var combinedText strings.Builder
 
@@ -188,7 +250,7 @@ func runAgentChunks(ctx context.Context, ollama *provider.OllamaProvider, model 
 		slog.Info("agent chunk", "subagent", agent.Subagent, "chunk", i+1, "total", len(diffChunks))
 		prompt := review.BuildPrompt(cfg, agent, chunk, coverageSummary)
 
-		resp, err := ollama.Generate(ctx, model, prompt)
+		resp, err := p.Generate(ctx, model, prompt)
 		if err != nil {
 			return combined, combinedText.String(), fmt.Errorf("chunk %d: %w", i+1, err)
 		}
