@@ -24,7 +24,9 @@ func (s SeveritySummary) Total() int {
 }
 
 // BuildPrompt constructs the full prompt for an agent.
-func BuildPrompt(cfg *config.Config, agent config.AgentConfig, diff string) string {
+// coverageSummary is optional; when non-empty it is injected into the prompt
+// so agents can flag low-coverage areas in the diff.
+func BuildPrompt(cfg *config.Config, agent config.AgentConfig, diff, coverageSummary string) string {
 	var b strings.Builder
 
 	b.WriteString("You are a code review agent. Review the following pull request diff and report findings.\n\n")
@@ -43,6 +45,12 @@ func BuildPrompt(cfg *config.Config, agent config.AgentConfig, diff string) stri
 		b.WriteString(fmt.Sprintf("**Audit Level**: %s\n", cfg.AuditLevel))
 	}
 	b.WriteString(fmt.Sprintf("**Security Level**: %s\n\n", cfg.SecurityLevel))
+
+	if coverageSummary != "" {
+		b.WriteString("## Test Coverage\n\n```\n")
+		b.WriteString(coverageSummary)
+		b.WriteString("\n```\n\n")
+	}
 
 	b.WriteString(fmt.Sprintf("## Agent Role: %s\n\n", agent.Subagent))
 	if agent.Additional != "" {

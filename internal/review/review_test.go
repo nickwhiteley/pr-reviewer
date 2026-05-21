@@ -18,7 +18,7 @@ func TestBuildPrompt(t *testing.T) {
 		Subagent:   "code-reviewer",
 		Additional: "focus on errors",
 	}
-	prompt := BuildPrompt(cfg, agent, "diff content")
+	prompt := BuildPrompt(cfg, agent, "diff content", "")
 	if !strings.Contains(prompt, "Nick") {
 		t.Error("prompt missing owner")
 	}
@@ -30,6 +30,27 @@ func TestBuildPrompt(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "diff content") {
 		t.Error("prompt missing diff")
+	}
+}
+
+func TestBuildPrompt_withCoverage(t *testing.T) {
+	cfg := &config.Config{Owner: "Nick", Context: "Test", ProductionStatus: "Dev", SecurityLevel: "Low"}
+	agent := config.AgentConfig{Subagent: "code-reviewer"}
+	prompt := BuildPrompt(cfg, agent, "diff content", "github.com/foo/bar/pkg\t75.0%")
+	if !strings.Contains(prompt, "Test Coverage") {
+		t.Error("prompt missing coverage section")
+	}
+	if !strings.Contains(prompt, "75.0%") {
+		t.Error("prompt missing coverage data")
+	}
+}
+
+func TestBuildPrompt_noCoverage(t *testing.T) {
+	cfg := &config.Config{Owner: "Nick", Context: "Test", ProductionStatus: "Dev", SecurityLevel: "Low"}
+	agent := config.AgentConfig{Subagent: "code-reviewer"}
+	prompt := BuildPrompt(cfg, agent, "diff content", "")
+	if strings.Contains(prompt, "Test Coverage") {
+		t.Error("prompt should not contain coverage section when empty")
 	}
 }
 

@@ -19,14 +19,15 @@ import (
 
 func main() {
 	var (
-		prNum      = flag.Int("pr", 0, "Pull request number")
-		repo       = flag.String("repo", "", "Repository in owner/name format")
-		base       = flag.String("base", "", "Base commit SHA")
-		head       = flag.String("head", "", "Head commit SHA")
-		model      = flag.String("model", "kimi-k2.6:cloud", "Ollama model to use")
-		debug      = flag.Bool("debug", false, "Enable debug logging")
-		configPath = flag.String("config", "PR-REVIEW.md", "Path to PR-REVIEW.md")
-		skipAgents = flag.Bool("skip-agents", false, "Skip AI agent reviews (hygiene only)")
+		prNum        = flag.Int("pr", 0, "Pull request number")
+		repo         = flag.String("repo", "", "Repository in owner/name format")
+		base         = flag.String("base", "", "Base commit SHA")
+		head         = flag.String("head", "", "Head commit SHA")
+		model        = flag.String("model", "kimi-k2.6:cloud", "Ollama model to use")
+		debug        = flag.Bool("debug", false, "Enable debug logging")
+		configPath   = flag.String("config", "PR-REVIEW.md", "Path to PR-REVIEW.md")
+		skipAgents   = flag.Bool("skip-agents", false, "Skip AI agent reviews (hygiene only)")
+		coverageFile = flag.String("coverage-file", "", "Path to go tool cover -func output to include in agent prompts")
 	)
 	flag.Parse()
 
@@ -40,6 +41,16 @@ func main() {
 	if *prNum == 0 || *repo == "" || *base == "" || *head == "" {
 		slog.Error("missing required flags", "pr", *prNum, "repo", *repo, "base", *base, "head", *head)
 		os.Exit(1)
+	}
+
+	var coverageSummary string
+	if *coverageFile != "" {
+		data, err := os.ReadFile(*coverageFile)
+		if err != nil {
+			slog.Warn("could not read coverage file", "path", *coverageFile, "error", err)
+		} else {
+			coverageSummary = strings.TrimSpace(string(data))
+		}
 	}
 
 	ctx := context.Background()
@@ -118,7 +129,7 @@ func main() {
 
 			ollama := provider.NewOllamaProvider()
 			slog.Info("running agent", "subagent", agent.Subagent, "chunks", len(diffChunks))
-			combinedSummary, combinedText, err := runAgentChunks(ctx, ollama, *model, cfg, agent, diffChunks)
+			combinedSummary, combinedText, err := runAgentChunks(ctx, ollama, *model, cfg, agent, diffChunks, coverageSummary)
 			if err != nil {
 				slog.Error("agent failed", "subagent", agent.Subagent, "error", err)
 
@@ -165,7 +176,7 @@ func main() {
 
 // runAgentChunks processes all diff chunks for a single agent and combines results.
 // Chunks are processed sequentially within an agent to avoid overwhelming the provider.
-func runAgentChunks(ctx context.Context, ollama *provider.OllamaProvider, model string, cfg *config.Config, agent config.AgentConfig, diffChunks []string) (review.SeveritySummary, string, error) {
+func runAgentChunks(ctx context.Context, ollama *provider.OllamaProvider, model string, cfg *config.Config, agent config.AgentConfig, diffChunks []string, coverageSummary string) (review.SeveritySummary, string, error) {
 	var combined review.SeveritySummary
 	var combinedText strings.Builder
 
@@ -175,7 +186,7 @@ func runAgentChunks(ctx context.Context, ollama *provider.OllamaProvider, model 
 		}
 
 		slog.Info("agent chunk", "subagent", agent.Subagent, "chunk", i+1, "total", len(diffChunks))
-		prompt := review.BuildPrompt(cfg, agent, chunk)
+		prompt := review.BuildPrompt(cfg, agent, chunk, coverageSummary)
 
 		resp, err := ollama.Generate(ctx, model, prompt)
 		if err != nil {
