@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +21,11 @@ import (
 )
 
 func main() {
+	// Subcommand dispatch before flag parsing: "pr-reviewer check-config [path]"
+	if len(os.Args) > 1 && os.Args[1] == "check-config" {
+		os.Exit(runCheckConfig(os.Args[2:]))
+	}
+
 	var (
 		prNum         = flag.Int("pr", 0, "Pull request number")
 		repo          = flag.String("repo", "", "Repository in owner/name format")
@@ -32,8 +38,19 @@ func main() {
 		coverageFile  = flag.String("coverage-file", "", "Path to go tool cover -func output to include in agent prompts")
 		providerName  = flag.String("provider", "ollama", "AI provider: ollama or anthropic")
 		reviewTimeout = flag.Int("review-timeout", 600, "Timeout in seconds for the AI review phase (0 = no timeout)")
+		failMode      = flag.String("fail-mode", "closed", "closed: agent failures/timeouts/unparseable results fail the check; open: they are advisory (exit 0)")
+		verify        = flag.Bool("verify", true, "Run a verification pass on each agent's findings to drop unsupported ones")
+		inline        = flag.Bool("inline-comments", true, "Post findings as inline PR review comments where they map to diff lines")
+		fileContext   = flag.Bool("file-context", true, "Include full changed-file contents (budgeted) in agent prompts")
+		dryRun        = flag.Bool("dry-run", false, "Print reports to stdout instead of posting to GitHub (no --pr/--repo needed)")
 	)
 	flag.Parse()
+
+	if *failMode != "closed" && *failMode != "open" {
+		fmt.Fprintf(os.Stderr, "invalid --fail-mode %q: must be closed or open\n", *failMode)
+		os.Exit(1)
+	}
+	failClosed := *failMode == "closed"
 
 	lvl := slog.LevelInfo
 	if *debug {
@@ -42,7 +59,12 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
 	slog.SetDefault(logger)
 
-	if *prNum == 0 || *repo == "" || *base == "" || *head == "" {
+	if *dryRun {
+		if *base == "" || *head == "" {
+			slog.Error("missing required flags for --dry-run", "base", *base, "head", *head)
+			os.Exit(1)
+		}
+	} else if *prNum == 0 || *repo == "" || *base == "" || *head == "" {
 		slog.Error("missing required flags", "pr", *prNum, "repo", *repo, "base", *base, "head", *head)
 		os.Exit(1)
 	}
@@ -60,8 +82,16 @@ func main() {
 	var p provider.Provider
 	switch *providerName {
 	case "anthropic":
+		if !*skipAgents && os.Getenv("ANTHROPIC_API_KEY") == "" {
+			slog.Error("ANTHROPIC_API_KEY is not set")
+			os.Exit(1)
+		}
 		p = provider.NewAnthropicProvider()
 	case "ollama":
+		if !*skipAgents && os.Getenv("OLLAMA_API_KEY") == "" {
+			slog.Error("OLLAMA_API_KEY is not set")
+			os.Exit(1)
+		}
 		p = provider.NewOllamaProvider()
 	default:
 		slog.Error("unknown provider", "provider", *providerName)
@@ -94,8 +124,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Setup GitHub client
-	gh := github.NewClient(*repo)
+	// Setup the comment destination: GitHub, or stdout in dry-run mode.
+	var gh *github.Client
+	var sink commentSink = stdoutSink{}
+	if !*dryRun {
+		gh, err = github.NewClient(*repo)
+		if err != nil {
+			slog.Error("github client setup failed", "error", err)
+			os.Exit(1)
+		}
+		sink = gh
+	}
 
 	// Run hygiene checks
 	runner := hygiene.NewRunner(coverageSummary)
@@ -111,7 +150,7 @@ func main() {
 	hygieneReport := hygiene.FormatReport(hygieneResults)
 
 	// Post hygiene comment
-	if err := gh.PostOrUpdate(ctx, *prNum, "<!-- wd-auto-review:type=hygiene -->", hygieneReport); err != nil {
+	if err := sink.PostOrUpdate(ctx, *prNum, "<!-- wd-auto-review:type=hygiene -->", hygieneReport); err != nil {
 		slog.Error("failed to post hygiene comment", "error", err)
 		os.Exit(1)
 	}
@@ -166,10 +205,12 @@ func main() {
 	// Best-effort: if this fails, every agent just runs without that
 	// context, same as before this feature existed.
 	var existingComments []github.Comment
-	if cs, err := gh.ListComments(ctx, *prNum); err != nil {
-		slog.Warn("could not list existing comments for previous-review context", "error", err)
-	} else {
-		existingComments = cs
+	if gh != nil {
+		if cs, err := gh.ListComments(ctx, *prNum); err != nil {
+			slog.Warn("could not list existing comments for previous-review context", "error", err)
+		} else {
+			existingComments = cs
+		}
 	}
 	previousReportFor := func(agent config.AgentConfig) string {
 		marker := fmt.Sprintf("<!-- wd-auto-review:agent=%s -->", agent.Subagent)
@@ -181,8 +222,63 @@ func main() {
 		return ""
 	}
 
-	// Build a context with a timeout for the AI review phase.
-	// On expiry we post a PR comment and exit 0 rather than failing the pipeline.
+	// Inline review comments already on the PR: reused both for discussion
+	// context and for inline-finding idempotency.
+	var reviewComments []github.ReviewComment
+	if gh != nil {
+		if rcs, err := gh.ListReviewComments(ctx, *prNum); err != nil {
+			slog.Warn("could not list review comments", "error", err)
+		} else {
+			reviewComments = rcs
+		}
+	}
+
+	// Inline comment infrastructure: valid diff positions for anchoring, and
+	// markers of findings already posted on earlier runs (idempotency).
+	var poster *inlinePoster
+	if *inline && gh != nil {
+		existingMarkers := make(map[string]bool)
+		for _, rc := range reviewComments {
+			if m := findingMarkerPattern.FindString(rc.Body); m != "" {
+				existingMarkers[m] = true
+			}
+		}
+		poster = &inlinePoster{
+			gh:       gh,
+			pr:       *prNum,
+			headSHA:  *head,
+			valid:    diff.NewSideLines(prDiff),
+			existing: existingMarkers,
+			budget:   maxInlineComments,
+		}
+	}
+
+	// Shared prompt input for every agent and chunk; per-chunk fields
+	// (Agent, Diff, ChunkNote, PreviousReport, FileContext) are filled in
+	// runAgentChunks. Everything here is best-effort context: a fetch
+	// failure degrades the review, it doesn't abort it.
+	basePrompt := review.PromptInput{
+		Cfg:             cfg,
+		CoverageSummary: coverageSummary,
+		Discussion:      buildDiscussion(existingComments, reviewComments),
+		Suppressions:    diff.Suppressions(prDiff),
+	}
+	if gh != nil {
+		if pr, err := gh.GetPR(ctx, *prNum); err != nil {
+			slog.Warn("could not fetch PR metadata", "error", err)
+		} else {
+			basePrompt.PRTitle = pr.Title
+			basePrompt.PRBody = pr.Body
+		}
+	}
+	if tree, err := diff.RepoTree(ctx, maxRepoTreeBytes); err != nil {
+		slog.Warn("could not build repo tree", "error", err)
+	} else {
+		basePrompt.RepoTree = tree
+	}
+
+	// Build a context with a timeout for the AI review phase. On expiry we
+	// post a PR comment and then fail or pass the check per --fail-mode.
 	var reviewCtx context.Context
 	var reviewCancel context.CancelFunc
 	if *reviewTimeout > 0 {
@@ -199,6 +295,7 @@ func main() {
 		mu                sync.Mutex
 		hasCriticalOrHigh bool
 		failedAgents      int
+		unverifiedAgents  int
 	)
 
 	for _, agent := range cfg.Agents {
@@ -208,7 +305,7 @@ func main() {
 
 			slog.Info("running agent", "subagent", agent.Subagent, "chunks", len(diffChunks), "provider", *providerName, "model", *model)
 			previousReport := previousReportFor(agent)
-			combinedSummary, combinedText, err := runAgentChunks(reviewCtx, p, *model, cfg, agent, diffChunks, coverageSummary, previousReport)
+			outcome, err := runAgentChunks(reviewCtx, p, *model, basePrompt, agent, diffChunks, previousReport, *verify, *fileContext)
 			if err != nil {
 				// If the review context expired, suppress individual failure comments —
 				// a single timeout comment will be posted after all goroutines finish.
@@ -223,7 +320,7 @@ func main() {
 
 				failureReport := review.FormatAgentFailureReport(agent, err)
 				marker := fmt.Sprintf("<!-- wd-auto-review:agent=%s -->", agent.Subagent)
-				if postErr := gh.PostOrUpdate(ctx, *prNum, marker, failureReport); postErr != nil {
+				if postErr := sink.PostOrUpdate(ctx, *prNum, marker, failureReport); postErr != nil {
 					slog.Error("failed to post agent failure comment", "subagent", agent.Subagent, "error", postErr)
 				}
 
@@ -234,94 +331,237 @@ func main() {
 			}
 
 			mu.Lock()
-			if combinedSummary.Critical > 0 || combinedSummary.High > 0 {
+			if outcome.summary.Critical > 0 || outcome.summary.High > 0 {
 				hasCriticalOrHigh = true
+			}
+			if outcome.parseFailures > 0 {
+				unverifiedAgents++
 			}
 			mu.Unlock()
 
-			report := review.FormatAgentReport(agent, combinedSummary, combinedText+skippedChunksNote)
+			body := review.RenderFindings(outcome.findings, outcome.dismissed, outcome.notes)
+			for _, raw := range outcome.fallbackTexts {
+				body += "\n\n---\n\n### Unstructured agent output\n\n" + raw + "\n"
+			}
+			if outcome.parseFailures > 0 {
+				body += fmt.Sprintf(
+					"\n\n---\n\n⚠️ **Results could not be parsed for %d of %d chunk(s)** — any findings there are "+
+						"shown as raw output above but are NOT reflected in the severity summary. Treat this review as incomplete.\n",
+					outcome.parseFailures, len(diffChunks),
+				)
+			}
+
+			report := review.FormatAgentReport(agent, outcome.summary, body+skippedChunksNote)
 			marker := fmt.Sprintf("<!-- wd-auto-review:agent=%s -->", agent.Subagent)
-			if err := gh.PostOrUpdate(ctx, *prNum, marker, report); err != nil {
+			if err := sink.PostOrUpdate(ctx, *prNum, marker, report); err != nil {
 				slog.Error("failed to post agent comment", "subagent", agent.Subagent, "error", err)
 				// Do not fail the pipeline for posting errors; the review result is still valid.
+			}
+
+			if poster != nil {
+				poster.post(ctx, agent.Subagent, outcome.findings)
 			}
 		}(agent)
 	}
 
 	wg.Wait()
 
-	// If the review timed out, post a single comment and exit successfully.
+	// If the review timed out, post a single comment. In closed mode this
+	// fails the check: an unreviewed PR must not show green (spec FR-013).
 	if errors.Is(reviewCtx.Err(), context.DeadlineExceeded) {
-		timeoutReport := formatTimeoutReport(*reviewTimeout, *providerName)
-		if postErr := gh.PostOrUpdate(ctx, *prNum, "<!-- wd-auto-review:type=timeout -->", timeoutReport); postErr != nil {
+		timeoutReport := formatTimeoutReport(*reviewTimeout, *providerName, failClosed)
+		if postErr := sink.PostOrUpdate(ctx, *prNum, "<!-- wd-auto-review:type=timeout -->", timeoutReport); postErr != nil {
 			slog.Error("failed to post timeout comment", "error", postErr)
 		}
-		slog.Info("review timed out — exiting 0", "timeout_seconds", *reviewTimeout)
+		if failClosed {
+			slog.Error("review timed out — failing check (fail-mode=closed)", "timeout_seconds", *reviewTimeout)
+			os.Exit(1)
+		}
+		slog.Info("review timed out — exiting 0 (fail-mode=open)", "timeout_seconds", *reviewTimeout)
 		return
 	}
 
-	if failedAgents > 0 {
-		slog.Info("review complete with agent failures", "failed", failedAgents)
-	}
 	if hasCriticalOrHigh {
 		slog.Info("review complete with critical/high findings")
 		os.Exit(1)
+	}
+	if failedAgents > 0 || unverifiedAgents > 0 {
+		if failClosed {
+			slog.Error("review incomplete — failing check (fail-mode=closed)",
+				"failed_agents", failedAgents, "unverified_agents", unverifiedAgents)
+			os.Exit(1)
+		}
+		slog.Info("review incomplete — exiting 0 (fail-mode=open)",
+			"failed_agents", failedAgents, "unverified_agents", unverifiedAgents)
+		return
 	}
 
 	slog.Info("review complete")
 }
 
 // formatTimeoutReport returns a PR comment body explaining that the review timed out.
-func formatTimeoutReport(timeoutSecs int, providerName string) string {
+func formatTimeoutReport(timeoutSecs int, providerName string, failClosed bool) string {
+	consequence := "This check is marked **failed** because the review could not complete — the PR has NOT been reviewed. " +
+		"A green check here must mean the code was actually looked at."
+	if !failClosed {
+		consequence = "This is **not a CI failure** (fail-mode=open) — but the code changes have NOT been reviewed by this tool."
+	}
 	return fmt.Sprintf(`## ⏱ PR Review — Agent Timeout
 
 The AI review agents did not complete within the configured timeout (%ds via the **%s** provider).
 
-This is **not a CI failure** — your other checks have passed. The code changes may still require manual review.
+%s
 
 **To retry:** re-run the *PR Review* workflow job from the GitHub Actions tab.
-`, timeoutSecs, providerName)
+`, timeoutSecs, providerName, consequence)
+}
+
+// agentOutcome is the combined result of one agent across all diff chunks.
+type agentOutcome struct {
+	summary   review.SeveritySummary
+	findings  []review.Finding
+	dismissed []review.Dismissed
+	notes     []string
+	// fallbackTexts holds raw chunk responses that had no parseable findings
+	// block; legacy severity blocks in them still count toward summary.
+	fallbackTexts []string
+	// parseFailures counts chunks whose response yielded neither findings
+	// nor a legacy severity block — unverifiable output.
+	parseFailures int
 }
 
 // runAgentChunks processes all diff chunks for a single agent and combines results.
 // Chunks are processed sequentially within an agent to avoid overwhelming the provider.
 // previousReport is this same agent's report from an earlier run on this PR (empty if
 // none), passed into every chunk's prompt so the agent can avoid blindly re-raising
-// findings that were already fixed or explained.
-func runAgentChunks(ctx context.Context, p provider.Provider, model string, cfg *config.Config, agent config.AgentConfig, diffChunks []string, coverageSummary string, previousReport string) (review.SeveritySummary, string, error) {
-	var combined review.SeveritySummary
-	var combinedText strings.Builder
+// findings that were already fixed or explained. When verify is true, each chunk's
+// findings go through a second self-verification pass that drops unsupported ones.
+func runAgentChunks(ctx context.Context, p provider.Provider, model string, base review.PromptInput, agent config.AgentConfig, diffChunks []string, previousReport string, verify bool, fileContext bool) (agentOutcome, error) {
+	var out agentOutcome
+	var legacySummary review.SeveritySummary
 
 	for i, chunk := range diffChunks {
 		if ctx.Err() != nil {
-			return combined, combinedText.String(), ctx.Err()
+			return out, ctx.Err()
 		}
 
 		slog.Info("agent chunk", "subagent", agent.Subagent, "chunk", i+1, "total", len(diffChunks))
-		chunkNote := review.ChunkNote(i+1, len(diffChunks))
-		prompt := review.BuildPrompt(cfg, agent, chunk, coverageSummary, chunkNote, previousReport)
+		in := base
+		in.Agent = agent
+		in.Diff = chunk
+		in.ChunkNote = review.ChunkNote(i+1, len(diffChunks))
+		in.PreviousReport = previousReport
+		if fileContext {
+			in.FileContext = buildFileContext(diff.FilePaths(chunk))
+		}
+		prompt := review.BuildPrompt(in)
 
 		resp, err := p.Generate(ctx, model, prompt)
 		if err != nil {
-			return combined, combinedText.String(), fmt.Errorf("chunk %d: %w", i+1, err)
+			return out, fmt.Errorf("chunk %d: %w", i+1, err)
 		}
 
-		summary, _, err := review.ParseSeverity(resp.Text)
+		findings, notes, err := review.ParseFindings(resp.Text)
 		if err != nil {
-			slog.Warn("could not parse severity", "subagent", agent.Subagent, "chunk", i+1, "error", err)
+			// No findings block. Accept a legacy severity-count block so a
+			// model that ignored the format still gates correctly; anything
+			// else is unverifiable and counted, not swallowed — it must not
+			// silently read as "no issues found".
+			if summary, _, serr := review.ParseSeverity(resp.Text); serr == nil {
+				legacySummary.Critical += summary.Critical
+				legacySummary.High += summary.High
+				legacySummary.Medium += summary.Medium
+				legacySummary.Low += summary.Low
+			} else {
+				out.parseFailures++
+				slog.Warn("could not parse agent response", "subagent", agent.Subagent, "chunk", i+1, "error", err)
+			}
+			out.fallbackTexts = append(out.fallbackTexts, resp.Text)
+			continue
 		}
 
-		combined.Critical += summary.Critical
-		combined.High += summary.High
-		combined.Medium += summary.Medium
-		combined.Low += summary.Low
-
-		if combinedText.Len() > 0 {
-			combinedText.WriteString("\n\n---\n\n")
+		if verify && len(findings) > 0 {
+			verified, dismissed, verr := verifyFindings(ctx, p, model, agent, chunk, findings)
+			if verr != nil {
+				slog.Warn("verification pass failed; keeping unverified findings",
+					"subagent", agent.Subagent, "chunk", i+1, "error", verr)
+			} else {
+				slog.Info("verification pass", "subagent", agent.Subagent, "chunk", i+1,
+					"draft", len(findings), "kept", len(verified), "dismissed", len(dismissed))
+				findings = verified
+				out.dismissed = append(out.dismissed, dismissed...)
+			}
 		}
-		combinedText.WriteString(fmt.Sprintf("### Chunk %d/%d\n\n", i+1, len(diffChunks)))
-		combinedText.WriteString(resp.Text)
+
+		out.findings = append(out.findings, findings...)
+		if notes != "" {
+			out.notes = append(out.notes, notes)
+		}
 	}
 
-	return combined, combinedText.String(), nil
+	out.findings = review.DedupeFindings(out.findings)
+	out.summary = review.SummaryFromFindings(out.findings)
+	out.summary.Critical += legacySummary.Critical
+	out.summary.High += legacySummary.High
+	out.summary.Medium += legacySummary.Medium
+	out.summary.Low += legacySummary.Low
+
+	return out, nil
+}
+
+// verifyFindings runs the self-verification pass for one chunk's findings.
+func verifyFindings(ctx context.Context, p provider.Provider, model string, agent config.AgentConfig, chunk string, findings []review.Finding) ([]review.Finding, []review.Dismissed, error) {
+	prompt := review.BuildVerificationPrompt(agent, chunk, findings)
+	resp, err := p.Generate(ctx, model, prompt)
+	if err != nil {
+		return nil, nil, err
+	}
+	return review.ParseVerification(resp.Text)
+}
+
+// findingMarkerPattern matches the idempotency marker embedded in inline
+// finding comments (see review.FindingMarker).
+var findingMarkerPattern = regexp.MustCompile(`<!-- wd-auto-review:finding=[^ ]+ -->`)
+
+// maxInlineComments caps inline comments posted per run so a pathological
+// review can't bury a PR; everything is always in the summary comment anyway.
+const maxInlineComments = 50
+
+// inlinePoster posts findings as inline PR review comments. Shared across
+// agent goroutines; bookkeeping is mutex-guarded, HTTP calls are not held
+// under the lock.
+type inlinePoster struct {
+	mu       sync.Mutex
+	gh       *github.Client
+	pr       int
+	headSHA  string
+	valid    map[string]map[int]bool // diff positions inline comments can anchor to
+	existing map[string]bool         // finding markers already on the PR
+	budget   int
+}
+
+func (ip *inlinePoster) post(ctx context.Context, agent string, findings []review.Finding) {
+	for _, f := range findings {
+		if !ip.valid[f.File][f.Line] {
+			slog.Debug("finding does not map to a diff line; summary comment only",
+				"agent", agent, "file", f.File, "line", f.Line)
+			continue
+		}
+		marker := review.FindingMarker(agent, f)
+
+		ip.mu.Lock()
+		if ip.existing[marker] || ip.budget <= 0 {
+			ip.mu.Unlock()
+			continue
+		}
+		ip.existing[marker] = true
+		ip.budget--
+		ip.mu.Unlock()
+
+		body := review.FormatInlineComment(agent, f)
+		if err := ip.gh.CreateReviewComment(ctx, ip.pr, ip.headSHA, f.File, f.Line, body); err != nil {
+			// Best-effort: the finding is still in the summary comment.
+			slog.Warn("could not post inline comment", "agent", agent, "file", f.File, "line", f.Line, "error", err)
+		}
+	}
 }

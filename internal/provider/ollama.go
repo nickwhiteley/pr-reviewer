@@ -74,7 +74,7 @@ func (o *OllamaProvider) Generate(ctx context.Context, model string, prompt stri
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "woodendollars-pr-review/1.0")
 
-	resp, err := o.doWithRetry(req)
+	resp, err := doWithRetry(o.client, req)
 	if err != nil {
 		return Response{}, fmt.Errorf("ollama generate: %w", err)
 	}
@@ -115,7 +115,9 @@ func (o *OllamaProvider) Generate(ctx context.Context, model string, prompt stri
 	return Response{}, fmt.Errorf("empty response from ollama")
 }
 
-func (o *OllamaProvider) doWithRetry(req *http.Request) (*http.Response, error) {
+// doWithRetry sends a request, retrying once on network errors and once on
+// 5xx responses, with a fresh body each attempt. Shared by all providers.
+func doWithRetry(client *http.Client, req *http.Request) (*http.Response, error) {
 	doReq := func(r *http.Request) (*http.Response, error) {
 		if r.GetBody != nil {
 			body, err := r.GetBody()
@@ -124,7 +126,7 @@ func (o *OllamaProvider) doWithRetry(req *http.Request) (*http.Response, error) 
 			}
 			r.Body = body
 		}
-		return o.client.Do(r)
+		return client.Do(r)
 	}
 
 	resp, err := doReq(req)

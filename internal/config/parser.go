@@ -70,16 +70,16 @@ func ParseBytes(data []byte) (*Config, error) {
 	flushSection(cfg, currentSection, buf.String())
 
 	if cfg.Owner == "" {
-		return nil, errors.New("missing required section: Who owns the repo")
+		return nil, errors.New(`missing required section: "Owner" (or "Who owns the repo")`)
 	}
 	if cfg.Context == "" {
-		return nil, errors.New("missing required section: Context and intent")
+		return nil, errors.New(`missing required section: "Context" (or "Context and intent")`)
 	}
 	if cfg.ProductionStatus == "" {
-		return nil, errors.New("missing required section: Production status")
+		return nil, errors.New(`missing required section: "Production Status"`)
 	}
 	if cfg.SecurityLevel == "" {
-		return nil, errors.New("missing required section: Security level")
+		return nil, errors.New(`missing required section: "Security Level"`)
 	}
 
 	return cfg, nil
@@ -88,9 +88,13 @@ func ParseBytes(data []byte) (*Config, error) {
 func flushSection(cfg *Config, section, content string) {
 	section = strings.ToLower(section)
 	switch {
-	case strings.Contains(section, "who owns the repo"):
+	// "owner" is matched exactly, not as a substring — "codeowners" would
+	// otherwise collide and overwrite the Owner field.
+	case strings.Contains(section, "who owns the repo") || section == "owner":
 		cfg.Owner = strings.TrimSpace(content)
-	case strings.Contains(section, "context and intent"):
+	// "context" alone must not swallow other sections, so match it exactly;
+	// the long form "context and intent" is matched as a substring.
+	case strings.Contains(section, "context and intent") || section == "context":
 		cfg.Context = strings.TrimSpace(content)
 	case strings.Contains(section, "production status"):
 		cfg.ProductionStatus = strings.TrimSpace(content)

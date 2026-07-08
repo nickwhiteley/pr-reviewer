@@ -239,3 +239,124 @@ func findSubstr(s, substr string) bool {
 	}
 	return false
 }
+
+func TestExcluded(t *testing.T) {
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"vendor/lib/a.go", true},
+		{"pkg/vendor/lib/a.go", true},
+		{"myvendor/a.go", false},
+		{"dist/bundle.js", true},
+		{"redist/bundle.js", false},
+		{"Cargo.lock", true},
+		{"pkg/Gemfile.lock", true},
+		{"locksmith.go", false},
+		{"api/service.pb.go", true},
+		{"types.gen.go", true},
+		{"generator.go", false},
+		{"go.sum", true},
+		{"sub/module/go.sum", true},
+		{"PR-REVIEW.md", true},
+		{"main.go", false},
+	}
+	for _, tc := range cases {
+		if got := excluded(tc.path); got != tc.want {
+			t.Errorf("excluded(%q) = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}
+
+func TestDiffFilePath(t *testing.T) {
+	if got := diffFilePath("diff --git a/internal/diff/diff.go b/internal/diff/diff.go"); got != "internal/diff/diff.go" {
+		t.Errorf("diffFilePath = %q", got)
+	}
+	if got := diffFilePath("not a diff header"); got != "" {
+		t.Errorf("diffFilePath on garbage = %q", got)
+	}
+}
+
+func TestNewSideLines(t *testing.T) {
+	raw := `diff --git a/main.go b/main.go
+index 111..222 100644
+--- a/main.go
++++ b/main.go
+@@ -10,4 +10,5 @@ func main() {
+ context line ten
+-removed line
++added line eleven
++added line twelve
+ context thirteen
+@@ -30,2 +31,2 @@ func other() {
+ context thirty-one
+ context thirty-two
+diff --git a/other.go b/other.go
+--- a/other.go
++++ b/other.go
+@@ -1,2 +1,2 @@
+-old
++new first line
+ second
+`
+	lines := NewSideLines(raw)
+
+	for _, n := range []int{10, 11, 12, 13, 31, 32} {
+		if !lines["main.go"][n] {
+			t.Errorf("main.go:%d should be a valid new-side line", n)
+		}
+	}
+	if lines["main.go"][14] || lines["main.go"][30] {
+		t.Error("lines outside hunks must not be valid")
+	}
+	if !lines["other.go"][1] || !lines["other.go"][2] {
+		t.Errorf("other.go lines wrong: %v", lines["other.go"])
+	}
+}
+
+func TestSuppressions(t *testing.T) {
+	raw := `diff --git a/db.go b/db.go
+--- a/db.go
++++ b/db.go
+@@ -1,3 +1,5 @@
+ package db
++// pr-review:allow sql-injection table name comes from a fixed enum
++func query() {}
++// pr-review:allow bare-directive-no-reason
+ // pr-review:allow unchanged-line this is context, not an added line
+`
+	got := Suppressions(raw)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 suppression (with reason, on an added line), got %d: %v", len(got), got)
+	}
+	if !strings.Contains(got[0], "db.go") || !strings.Contains(got[0], "sql-injection") || !strings.Contains(got[0], "fixed enum") {
+		t.Errorf("suppression = %q", got[0])
+	}
+}
+
+func TestFilePaths(t *testing.T) {
+	raw := "diff --git a/x.go b/x.go\n+foo\ndiff --git a/dir/y.go b/dir/y.go\n+bar\n"
+	got := FilePaths(raw)
+	if len(got) != 2 || got[0] != "x.go" || got[1] != "dir/y.go" {
+		t.Errorf("FilePaths = %v", got)
+	}
+}
+
+func TestNewSideLines_noNewlineMarkerMidHunk(t *testing.T) {
+	raw := `diff --git a/f.txt b/f.txt
+--- a/f.txt
++++ b/f.txt
+@@ -1,2 +1,3 @@
+ context one
+-old last
+\ No newline at end of file
++new two
++new three
+`
+	lines := NewSideLines(raw)
+	for _, n := range []int{1, 2, 3} {
+		if !lines["f.txt"][n] {
+			t.Errorf("f.txt:%d should be valid despite mid-hunk no-newline marker", n)
+		}
+	}
+}

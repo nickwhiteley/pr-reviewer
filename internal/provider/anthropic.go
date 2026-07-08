@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -57,7 +58,7 @@ func (a *AnthropicProvider) Generate(ctx context.Context, model string, prompt s
 	req.Header.Set("anthropic-version", anthropicVersion)
 	req.Header.Set("content-type", "application/json")
 
-	resp, err := a.client.Do(req)
+	resp, err := doWithRetry(a.client, req)
 	if err != nil {
 		return Response{}, fmt.Errorf("anthropic generate: %w", err)
 	}
@@ -67,12 +68,10 @@ func (a *AnthropicProvider) Generate(ctx context.Context, model string, prompt s
 	if err != nil {
 		return Response{}, fmt.Errorf("read response: %w", err)
 	}
-	if resp.StatusCode >= 400 {
-		return Response{}, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
-	}
 
 	var result struct {
-		Content []struct {
+		StopReason string `json:"stop_reason"`
+		Content    []struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
 		} `json:"content"`
@@ -80,10 +79,20 @@ func (a *AnthropicProvider) Generate(ctx context.Context, model string, prompt s
 	if err := json.Unmarshal(body, &result); err != nil {
 		return Response{}, fmt.Errorf("decode response: %w", err)
 	}
+	if result.StopReason == "max_tokens" {
+		// A truncated report may have lost findings or its severity block;
+		// failing here routes into the agent-failure path instead of a
+		// silently incomplete review.
+		return Response{}, fmt.Errorf("anthropic response truncated at max_tokens — report would be incomplete")
+	}
+	var text strings.Builder
 	for _, block := range result.Content {
-		if block.Type == "text" && block.Text != "" {
-			return Response{Text: block.Text}, nil
+		if block.Type == "text" {
+			text.WriteString(block.Text)
 		}
 	}
-	return Response{}, fmt.Errorf("empty response from anthropic")
+	if text.Len() == 0 {
+		return Response{}, fmt.Errorf("empty response from anthropic")
+	}
+	return Response{Text: text.String()}, nil
 }

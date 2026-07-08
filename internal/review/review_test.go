@@ -18,7 +18,7 @@ func TestBuildPrompt(t *testing.T) {
 		Subagent:   "code-reviewer",
 		Additional: "focus on errors",
 	}
-	prompt := BuildPrompt(cfg, agent, "diff content", "", "", "")
+	prompt := BuildPrompt(PromptInput{Cfg: cfg, Agent: agent, Diff: "diff content"})
 	if !strings.Contains(prompt, "Nick") {
 		t.Error("prompt missing owner")
 	}
@@ -39,7 +39,7 @@ func TestBuildPrompt(t *testing.T) {
 func TestBuildPrompt_withCoverage(t *testing.T) {
 	cfg := &config.Config{Owner: "Nick", Context: "Test", ProductionStatus: "Dev", SecurityLevel: "Low"}
 	agent := config.AgentConfig{Subagent: "code-reviewer"}
-	prompt := BuildPrompt(cfg, agent, "diff content", "github.com/foo/bar/pkg\t75.0%", "", "")
+	prompt := BuildPrompt(PromptInput{Cfg: cfg, Agent: agent, Diff: "diff content", CoverageSummary: "github.com/foo/bar/pkg\t75.0%"})
 	if !strings.Contains(prompt, "Test Coverage") {
 		t.Error("prompt missing coverage section")
 	}
@@ -51,7 +51,7 @@ func TestBuildPrompt_withCoverage(t *testing.T) {
 func TestBuildPrompt_noCoverage(t *testing.T) {
 	cfg := &config.Config{Owner: "Nick", Context: "Test", ProductionStatus: "Dev", SecurityLevel: "Low"}
 	agent := config.AgentConfig{Subagent: "code-reviewer"}
-	prompt := BuildPrompt(cfg, agent, "diff content", "", "", "")
+	prompt := BuildPrompt(PromptInput{Cfg: cfg, Agent: agent, Diff: "diff content"})
 	if strings.Contains(prompt, "Test Coverage") {
 		t.Error("prompt should not contain coverage section when empty")
 	}
@@ -61,7 +61,7 @@ func TestBuildPrompt_withChunkNote(t *testing.T) {
 	cfg := &config.Config{Owner: "Nick", Context: "Test", ProductionStatus: "Dev", SecurityLevel: "Low"}
 	agent := config.AgentConfig{Subagent: "code-reviewer"}
 	note := ChunkNote(2, 3)
-	prompt := BuildPrompt(cfg, agent, "diff content", "", note, "")
+	prompt := BuildPrompt(PromptInput{Cfg: cfg, Agent: agent, Diff: "diff content", ChunkNote: note})
 	if !strings.Contains(prompt, "Diff Coverage Notice") {
 		t.Error("prompt missing diff coverage notice section")
 	}
@@ -73,7 +73,7 @@ func TestBuildPrompt_withChunkNote(t *testing.T) {
 func TestBuildPrompt_noChunkNoteWhenEmpty(t *testing.T) {
 	cfg := &config.Config{Owner: "Nick", Context: "Test", ProductionStatus: "Dev", SecurityLevel: "Low"}
 	agent := config.AgentConfig{Subagent: "code-reviewer"}
-	prompt := BuildPrompt(cfg, agent, "diff content", "", "", "")
+	prompt := BuildPrompt(PromptInput{Cfg: cfg, Agent: agent, Diff: "diff content"})
 	// The Severity Discipline section references "Diff Coverage Notice" by
 	// name even when there isn't one, so check for the section heading
 	// itself rather than the bare phrase.
@@ -85,7 +85,7 @@ func TestBuildPrompt_noChunkNoteWhenEmpty(t *testing.T) {
 func TestBuildPrompt_withPreviousReport(t *testing.T) {
 	cfg := &config.Config{Owner: "Nick", Context: "Test", ProductionStatus: "Dev", SecurityLevel: "Low"}
 	agent := config.AgentConfig{Subagent: "code-reviewer"}
-	prompt := BuildPrompt(cfg, agent, "diff content", "", "", "## Code Review: code-reviewer\n\nPrior finding text.")
+	prompt := BuildPrompt(PromptInput{Cfg: cfg, Agent: agent, Diff: "diff content", PreviousReport: "## Code Review: code-reviewer\n\nPrior finding text."})
 	if !strings.Contains(prompt, "Your Previous Review Of This PR") {
 		t.Error("prompt missing previous review section")
 	}

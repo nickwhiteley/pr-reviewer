@@ -1,0 +1,84 @@
+name: "PR Reviewer"
+description: >-
+  AI-powered pull request review: deterministic hygiene checks plus
+  multi-agent AI code review with structured, verified findings posted as PR
+  comments. Configured per-repository via PR-REVIEW.md.
+branding:
+  icon: "eye"
+  color: "purple"
+
+inputs:
+  provider:
+    description: "AI provider: ollama or anthropic"
+    default: "ollama"
+  api-key:
+    description: "API key for the chosen provider (OLLAMA_API_KEY / ANTHROPIC_API_KEY)"
+    required: true
+  github-token:
+    description: "Token used to post PR comments"
+    default: ${{ github.token }}
+  model:
+    description: "Model identifier (defaults to the provider's standard model)"
+    default: ""
+  config:
+    description: "Path to PR-REVIEW.md"
+    default: "PR-REVIEW.md"
+  fail-mode:
+    description: "closed (default): agent failures/timeouts fail the check; open: they are advisory"
+    default: "closed"
+  review-timeout:
+    description: "Timeout in seconds for the AI review phase"
+    default: "600"
+  version:
+    description: "pr-reviewer release tag to install (e.g. v1.2.3), or latest"
+    default: "latest"
+  extra-args:
+    description: "Additional CLI flags, e.g. --verify=false --inline-comments=false"
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install pr-reviewer
+      shell: bash
+      run: |
+        set -euo pipefail
+        case "${{ runner.os }}-${{ runner.arch }}" in
+          Linux-X64)    asset="pr-reviewer_linux_amd64.tar.gz" ;;
+          Linux-ARM64)  asset="pr-reviewer_linux_arm64.tar.gz" ;;
+          macOS-X64)    asset="pr-reviewer_darwin_amd64.tar.gz" ;;
+          macOS-ARM64)  asset="pr-reviewer_darwin_arm64.tar.gz" ;;
+          *) echo "unsupported runner: ${{ runner.os }}-${{ runner.arch }}" >&2; exit 1 ;;
+        esac
+        version="${{ inputs.version }}"
+        if [ "$version" = "latest" ]; then
+          url="https://github.com/nickwhiteley/pr-reviewer/releases/latest/download/$asset"
+        else
+          url="https://github.com/nickwhiteley/pr-reviewer/releases/download/$version/$asset"
+        fi
+        mkdir -p "$RUNNER_TEMP/pr-reviewer"
+        curl -fsSL "$url" | tar -xz -C "$RUNNER_TEMP/pr-reviewer"
+        echo "$RUNNER_TEMP/pr-reviewer" >> "$GITHUB_PATH"
+
+    - name: Run PR review
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        OLLAMA_API_KEY: ${{ inputs.provider == 'ollama' && inputs.api-key || '' }}
+        ANTHROPIC_API_KEY: ${{ inputs.provider == 'anthropic' && inputs.api-key || '' }}
+      run: |
+        set -euo pipefail
+        model_flag=""
+        if [ -n "${{ inputs.model }}" ]; then
+          model_flag="--model ${{ inputs.model }}"
+        fi
+        pr-reviewer \
+          --pr "${{ github.event.pull_request.number }}" \
+          --repo "${{ github.repository }}" \
+          --base "${{ github.event.pull_request.base.sha }}" \
+          --head "${{ github.event.pull_request.head.sha }}" \
+          --provider "${{ inputs.provider }}" \
+          --config "${{ inputs.config }}" \
+          --fail-mode "${{ inputs.fail-mode }}" \
+          --review-timeout "${{ inputs.review-timeout }}" \
+          $model_flag ${{ inputs.extra-args }}

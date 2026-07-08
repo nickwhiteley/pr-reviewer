@@ -11,9 +11,23 @@ Every merge to `main` publishes a new binary release automatically.
 1. Reads `PR-REVIEW.md` from the repository root to learn the project's context and which agents/checks to run
 2. Computes the diff between base and head commits (excluding vendored files, lock files, generated code)
 3. Runs ticked hygiene checks deterministically — no AI required
-4. Splits large diffs into 50 KB chunks and runs each configured AI agent in parallel
-5. Posts (or updates) a comment per agent on the pull request using HTML markers for idempotency
-6. Exits with code `1` if any agent reports a critical or high severity finding
+4. Gathers review context: the PR title and description, human discussion on the PR, the full contents of changed files, and a repository file listing — so agents judge the change in context instead of guessing from hunks
+5. Splits large diffs into 50 KB chunks and runs each configured AI agent in parallel; agents report **structured findings** (file, line, severity, rationale, suggested fix)
+6. Runs a **verification pass** on each agent's draft findings, dismissing anything speculative or explained as intentional (dismissals are listed in the report for auditability)
+7. Posts (or updates) a comment per agent on the pull request, plus **inline review comments** on the exact lines where findings map to the diff
+8. Exits with code `1` if any verified finding is critical or high severity — or, by default, if the review itself could not complete (see fail modes)
+
+### Intentional findings
+
+Reviews respect the author's stated intent, from three sources:
+
+- **PR description and discussion** — human explanations on the PR ("the retry is deliberate, upstream flakes") are included in agent prompts and honored.
+- **`pr-review:allow` directives** — an added code comment of the form `// pr-review:allow <topic> <reason>` suppresses matching findings for that code. A directive **without a reason is ignored**, and honored suppressions are surfaced in the report rather than silently dropped.
+- **Previous reviews** — on re-runs, each agent sees its own prior report and does not blindly re-raise addressed findings.
+
+### Fail modes
+
+By default the tool **fails closed**: if agents error out, time out, or return unparseable results, the check fails — a green tick always means the code was actually reviewed. Set `--fail-mode open` to make infrastructure failures advisory (exit 0) while still failing on critical/high findings.
 
 ---
 
@@ -59,6 +73,14 @@ pr-reviewer \
   --config PR-REVIEW.md
 ```
 
+### Subcommands
+
+```bash
+pr-reviewer check-config [path]   # validate PR-REVIEW.md and show what a review would run
+```
+
+Run `check-config` in CI (or a pre-commit hook) on repos that edit their `PR-REVIEW.md`, so a config typo is caught when it's introduced rather than on the next PR.
+
 ### Flags
 
 | Flag | Default | Description |
@@ -68,8 +90,16 @@ pr-reviewer \
 | `--base` | required | Base commit SHA |
 | `--head` | required | Head commit SHA |
 | `--config` | `PR-REVIEW.md` | Path to the config file |
-| `--model` | `kimi-k2.6:cloud` | Ollama model name |
+| `--provider` | `ollama` | AI provider: `ollama` or `anthropic` |
+| `--model` | provider default | Model name (`kimi-k2.6:cloud` / `claude-sonnet-4-6`) |
+| `--fail-mode` | `closed` | `closed`: failures/timeouts/unparseable results fail the check; `open`: advisory |
+| `--verify` | true | Second-pass verification of each agent's findings |
+| `--inline-comments` | true | Post findings as inline review comments on diff lines |
+| `--file-context` | true | Include full changed-file contents (budgeted) in prompts |
+| `--review-timeout` | 600 | Seconds allowed for the AI review phase (0 = unlimited) |
 | `--skip-agents` | false | Run hygiene checks only, skip AI agents |
+| `--dry-run` | false | Print reports to stdout instead of posting (only `--base`/`--head` required) |
+| `--coverage-file` | | Path to `go tool cover -func` output to include in prompts |
 | `--debug` | false | Enable debug logging |
 
 ### Environment variables
@@ -77,8 +107,9 @@ pr-reviewer \
 | Variable | Description |
 |---|---|
 | `GITHUB_TOKEN` | GitHub token with `pull-requests: write` permission |
-| `OLLAMA_API_KEY` | API key for the Ollama endpoint |
+| `OLLAMA_API_KEY` | API key for the Ollama endpoint (provider `ollama`) |
 | `OLLAMA_ENDPOINT` | Override the Ollama API URL (default: `https://ollama.com/api/chat`) |
+| `ANTHROPIC_API_KEY` | API key for the Anthropic API (provider `anthropic`) |
 
 ---
 
@@ -157,7 +188,7 @@ Configure agents as a Markdown table. Each row is one agent invocation.
 
 ## GitHub Actions integration
 
-Add to `.github/workflows/pr-review.yml` in your repository:
+The recommended path for rolling out across multiple repositories is the bundled composite action — each repo gets a five-line workflow and upgrades are centralized:
 
 ```yaml
 name: PR Review
@@ -171,14 +202,34 @@ permissions:
   contents: read
   pull-requests: write
 
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   review:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0   # required: the reviewer diffs base..head locally
 
+      - uses: nickwhiteley/pr-reviewer@main   # or pin: nickwhiteley/pr-reviewer@v1.2.3
+        with:
+          api-key: ${{ secrets.OLLAMA_API_KEY }}
+          # provider: anthropic          # optional overrides
+          # fail-mode: open
+          # extra-args: --verify=false
+```
+
+Add `OLLAMA_API_KEY` (or `ANTHROPIC_API_KEY` via `provider: anthropic`) as a repository or organization secret. The `github-token` input defaults to the workflow's own token.
+
+**Fork PRs**: the standard `pull_request` trigger does not expose secrets to PRs from forks, so AI review silently cannot run there — with the default `fail-mode: closed`, those runs fail explicitly rather than pretending to have reviewed. Keep human review mandatory for fork PRs.
+
+<details>
+<summary>Manual installation (without the composite action)</summary>
+
+```yaml
       - name: Install pr-reviewer
         run: |
           gh release download \
@@ -202,9 +253,7 @@ jobs:
           OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
 ```
 
-Add `OLLAMA_API_KEY` as a repository secret. The `GITHUB_TOKEN` is provided automatically.
-
-To pin to a specific version, replace `--repo nickwhiteley/pr-reviewer` with `--repo nickwhiteley/pr-reviewer --tag v1.2.3`.
+</details>
 
 ---
 
@@ -212,8 +261,12 @@ To pin to a specific version, replace `--repo nickwhiteley/pr-reviewer` with `--
 
 | Code | Meaning |
 |---|---|
-| `0` | All checks passed; no critical or high findings |
-| `1` | Critical or high severity finding detected, or infrastructure failure |
+| `0` | Review completed; no critical or high findings |
+| `1` | Critical or high severity finding detected — or, with the default `--fail-mode closed`, the review could not complete (agent failure, timeout, unparseable results) |
+
+## Prompt-injection hardening
+
+The diff, PR description, and discussion are attacker-controlled text that ends up inside AI prompts. Agents are instructed to treat those sections strictly as data and to report (as a HIGH finding) any text that tries to steer the review, and the verification pass re-checks findings against the diff. This reduces but cannot eliminate the risk — for repositories where a malicious PR author is a realistic threat, keep a human approval requirement in branch protection alongside this tool.
 
 ---
 

@@ -57,3 +57,48 @@ func TestParseBytes_missingRequired(t *testing.T) {
 		t.Fatal("expected error for empty input")
 	}
 }
+
+// TestParse_exampleFile guards against the parser drifting out of sync with
+// the example config that users are told to copy into their repositories.
+func TestParse_exampleFile(t *testing.T) {
+	cfg, err := Parse("../../example/PR-REVIEW.md")
+	if err != nil {
+		t.Fatalf("example/PR-REVIEW.md failed to parse: %v", err)
+	}
+	if cfg.Owner == "" {
+		t.Error("example owner not parsed")
+	}
+	if cfg.Context == "" {
+		t.Error("example context not parsed")
+	}
+	if len(cfg.Hygiene) != 4 {
+		t.Errorf("expected 4 hygiene checks in example, got %d", len(cfg.Hygiene))
+	}
+	if len(cfg.Agents) != 4 {
+		t.Errorf("expected 4 agents in example, got %d", len(cfg.Agents))
+	}
+}
+
+func TestParseBytes_codeownersSectionDoesNotClobberOwner(t *testing.T) {
+	cfg, err := ParseBytes([]byte(`## Owner
+Nick
+
+## Codeowners
+platform-team
+
+## Context
+App
+
+## Production Status
+Dev
+
+## Security Level
+Low
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Owner != "Nick" {
+		t.Errorf("owner = %q, clobbered by Codeowners section", cfg.Owner)
+	}
+}

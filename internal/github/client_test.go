@@ -1,79 +1,129 @@
 package github
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 )
 
-func TestListComments(t *testing.T) {
+func newTestClient(t *testing.T, srv *httptest.Server) *Client {
+	t.Helper()
+	t.Setenv("GITHUB_TOKEN", "token")
+	c, err := NewClient("owner/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.SetBaseURL(srv.URL)
+	return c
+}
+
+func TestNewClient_validation(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "token")
+	if _, err := NewClient("no-slash"); err == nil {
+		t.Error("expected error for repo without owner/name format")
+	}
+	if _, err := NewClient("owner/"); err == nil {
+		t.Error("expected error for empty repo name")
+	}
+	t.Setenv("GITHUB_TOKEN", "")
+	if _, err := NewClient("owner/repo"); err == nil {
+		t.Error("expected error for missing GITHUB_TOKEN")
+	}
+}
+
+func TestListComments_paginates(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/repos/owner/repo/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "GET" {
-			t.Errorf("expected GET, got %s", r.Method)
+		page := r.URL.Query().Get("page")
+		var comments []Comment
+		switch page {
+		case "1":
+			// A full page signals that more may follow.
+			for i := range 100 {
+				comments = append(comments, Comment{ID: int64(i), Body: fmt.Sprintf("c%d", i)})
+			}
+		case "2":
+			comments = []Comment{{ID: 100, Body: "last"}}
 		}
-		json.NewEncoder(w).Encode([]Comment{{ID: 42, Body: "hello"}})
+		json.NewEncoder(w).Encode(comments)
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	os.Setenv("GITHUB_TOKEN", "token")
-	defer os.Unsetenv("GITHUB_TOKEN")
-
-	c := NewClient("owner/repo")
-	// override base URL via internal field not exposed; instead we test via httptest in integration
-	// For unit tests we'll test the request building logic indirectly.
-	_ = c
+	c := newTestClient(t, srv)
+	comments, err := c.ListComments(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(comments) != 101 {
+		t.Errorf("expected 101 comments across pages, got %d", len(comments))
+	}
 }
 
 func TestPostOrUpdate(t *testing.T) {
-	var created bool
-	var updated bool
+	var created, updated bool
 	mux := http.NewServeMux()
 	mux.HandleFunc("/repos/owner/repo/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "GET" {
+		switch r.Method {
+		case "GET":
 			json.NewEncoder(w).Encode([]Comment{
 				{ID: 10, Body: "existing <!-- marker:foo -->"},
 			})
-			return
-		}
-		if r.Method == "POST" {
+		case "POST":
 			created = true
 			w.WriteHeader(http.StatusCreated)
 			json.NewEncoder(w).Encode(Comment{ID: 99})
-			return
 		}
 	})
 	mux.HandleFunc("/repos/owner/repo/issues/comments/10", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "PATCH" {
 			updated = true
-			w.WriteHeader(http.StatusOK)
 		}
 	})
-
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	os.Setenv("GITHUB_TOKEN", "token")
-	defer os.Unsetenv("GITHUB_TOKEN")
+	c := newTestClient(t, srv)
 
-	// We need a way to inject the test server URL. For now this test is a skeleton showing intent.
-	// Full integration tests will cover the actual HTTP round-trips.
-	fmt.Println("PostOrUpdate test skeleton:", srv.URL, created, updated)
+	// Marker present in an existing comment: update in place.
+	if err := c.PostOrUpdate(context.Background(), 1, "<!-- marker:foo -->", "new body"); err != nil {
+		t.Fatal(err)
+	}
+	if !updated || created {
+		t.Errorf("expected update without create, got updated=%v created=%v", updated, created)
+	}
+
+	// Unknown marker: create a fresh comment.
+	updated, created = false, false
+	if err := c.PostOrUpdate(context.Background(), 1, "<!-- marker:bar -->", "new body"); err != nil {
+		t.Fatal(err)
+	}
+	if !created || updated {
+		t.Errorf("expected create without update, got updated=%v created=%v", updated, created)
+	}
 }
 
-func TestPostOrUpdate_longBody(t *testing.T) {
-	// GitHub comments have a 65536 character limit.
-	// Verify our client can handle bodies near that limit.
-	body := strings.Repeat("a", 70000)
+func TestTruncateBody(t *testing.T) {
 	marker := "<!-- wd-auto-review:type=hygiene -->"
 
-	// For now, just verify the body contains the marker.
-	if !strings.Contains(body+marker, marker) {
-		t.Error("marker missing")
+	short := "short body " + marker
+	if got := truncateBody(short, marker); got != short {
+		t.Error("short body should be unchanged")
+	}
+
+	long := strings.Repeat("é", 40000) + marker // multi-byte content past the limit
+	got := truncateBody(long, marker)
+	if len(got) > maxCommentLen {
+		t.Errorf("truncated body is %d bytes, exceeds limit %d", len(got), maxCommentLen)
+	}
+	if !strings.Contains(got, marker) {
+		t.Error("marker lost in truncation — comment would duplicate on next run")
+	}
+	if !strings.HasSuffix(strings.TrimSpace(got), marker) {
+		t.Error("marker should be re-appended at the end")
 	}
 }
