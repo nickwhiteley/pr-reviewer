@@ -28,9 +28,24 @@ var exclusions = []string{
 	"CLAUDE.md",
 }
 
-const maxDiffSize = 100 * 1024 // 100KB
-
 // Compute returns the diff between base and head.
+//
+// This does NOT truncate the result, even for large PRs. It used to
+// hard-truncate the whole diff to 100KB before any per-file chunking ran,
+// which silently dropped entire files from every downstream chunk — not
+// just the last one, since chunking (SplitFiles/ChunkFiles) only ever saw
+// whatever survived this cutoff. In practice that meant large-but-normal
+// PRs (a few hundred KB across 20-30 files) had roughly half their files
+// invisible to every review agent, in every chunk, with no correct
+// indication of which files were affected — agents would report "diff
+// truncated, no reviewable changes" for a chunk boundary that had nothing
+// to do with the actual file list, and speculate about files they never
+// saw at all. Chunking already exists specifically to handle diffs larger
+// than one provider call can take; a second, earlier, whole-diff cutoff
+// defeated it. The caller (cmd/review) is responsible for capping the
+// number of *chunks* actually sent to a provider, which is the real cost
+// control and — unlike a raw byte cutoff — can honestly report what
+// wasn't reviewed instead of silently mangling file boundaries.
 func Compute(ctx context.Context, base, head string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", "diff", base, head)
 	out, err := cmd.Output()
@@ -41,11 +56,7 @@ func Compute(ctx context.Context, base, head string) (string, error) {
 		return "", fmt.Errorf("git diff: %w", err)
 	}
 
-	filtered := filterDiff(string(out))
-	if len(filtered) > maxDiffSize {
-		return filtered[:maxDiffSize] + "\n\n[diff truncated at 500KB]", nil
-	}
-	return filtered, nil
+	return filterDiff(string(out)), nil
 }
 
 func filterDiff(raw string) string {

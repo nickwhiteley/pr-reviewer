@@ -121,7 +121,12 @@ func main() {
 		return
 	}
 
-	// Prepare diff chunks
+	// Prepare diff chunks. diff.Compute returns the full diff, untruncated —
+	// chunking (not a whole-diff byte cutoff) is what handles large PRs, so
+	// that no file is ever silently invisible to every chunk. The only cap
+	// left is on the NUMBER of chunks actually sent to a provider, below,
+	// which is a cost/time control, not a correctness one, and reports
+	// honestly what it skipped.
 	var diffChunks []string
 	if len(prDiff) <= diff.MaxChunkSize {
 		diffChunks = []string{prDiff}
@@ -133,6 +138,47 @@ func main() {
 			diffChunks = append(diffChunks, strings.Join(c, "\n"))
 			slog.Debug("chunk size", "chunk", i, "bytes", len(diffChunks[i]))
 		}
+	}
+
+	// Cap the number of chunks actually reviewed per agent — a genuinely
+	// pathological diff (accidentally-committed vendor dump, huge generated
+	// file that slipped past exclusions, etc.) shouldn't turn into dozens of
+	// sequential provider calls per agent. Unlike the old whole-diff byte
+	// truncation this removed, it's honest about what it skips instead of
+	// silently cutting content off mid-file and letting an agent guess.
+	const maxChunksPerAgent = 12
+	var skippedChunksNote string
+	if len(diffChunks) > maxChunksPerAgent {
+		slog.Warn("diff has more chunks than the per-agent cap; skipping the rest",
+			"total_chunks", len(diffChunks), "cap", maxChunksPerAgent)
+		skippedChunksNote = fmt.Sprintf(
+			"\n\n---\n\n**Note**: this PR's diff produced %d chunks; only the first %d were reviewed "+
+				"(cost/time cap per agent). Files beyond that point were not reviewed by this tool. "+
+				"Consider splitting this PR, or request a manual review of the remaining files.\n",
+			len(diffChunks), maxChunksPerAgent,
+		)
+		diffChunks = diffChunks[:maxChunksPerAgent]
+	}
+
+	// Fetch existing PR comments once, up front, so each agent can see its
+	// own prior report (if this is a re-run on a pushed-to PR) and avoid
+	// blindly re-raising a finding that was already fixed or explained.
+	// Best-effort: if this fails, every agent just runs without that
+	// context, same as before this feature existed.
+	var existingComments []github.Comment
+	if cs, err := gh.ListComments(ctx, *prNum); err != nil {
+		slog.Warn("could not list existing comments for previous-review context", "error", err)
+	} else {
+		existingComments = cs
+	}
+	previousReportFor := func(agent config.AgentConfig) string {
+		marker := fmt.Sprintf("<!-- wd-auto-review:agent=%s -->", agent.Subagent)
+		for _, cm := range existingComments {
+			if strings.Contains(cm.Body, marker) {
+				return cm.Body
+			}
+		}
+		return ""
 	}
 
 	// Build a context with a timeout for the AI review phase.
@@ -161,7 +207,8 @@ func main() {
 			defer wg.Done()
 
 			slog.Info("running agent", "subagent", agent.Subagent, "chunks", len(diffChunks), "provider", *providerName, "model", *model)
-			combinedSummary, combinedText, err := runAgentChunks(reviewCtx, p, *model, cfg, agent, diffChunks, coverageSummary)
+			previousReport := previousReportFor(agent)
+			combinedSummary, combinedText, err := runAgentChunks(reviewCtx, p, *model, cfg, agent, diffChunks, coverageSummary, previousReport)
 			if err != nil {
 				// If the review context expired, suppress individual failure comments —
 				// a single timeout comment will be posted after all goroutines finish.
@@ -192,7 +239,7 @@ func main() {
 			}
 			mu.Unlock()
 
-			report := review.FormatAgentReport(agent, combinedSummary, combinedText)
+			report := review.FormatAgentReport(agent, combinedSummary, combinedText+skippedChunksNote)
 			marker := fmt.Sprintf("<!-- wd-auto-review:agent=%s -->", agent.Subagent)
 			if err := gh.PostOrUpdate(ctx, *prNum, marker, report); err != nil {
 				slog.Error("failed to post agent comment", "subagent", agent.Subagent, "error", err)
@@ -238,7 +285,10 @@ This is **not a CI failure** — your other checks have passed. The code changes
 
 // runAgentChunks processes all diff chunks for a single agent and combines results.
 // Chunks are processed sequentially within an agent to avoid overwhelming the provider.
-func runAgentChunks(ctx context.Context, p provider.Provider, model string, cfg *config.Config, agent config.AgentConfig, diffChunks []string, coverageSummary string) (review.SeveritySummary, string, error) {
+// previousReport is this same agent's report from an earlier run on this PR (empty if
+// none), passed into every chunk's prompt so the agent can avoid blindly re-raising
+// findings that were already fixed or explained.
+func runAgentChunks(ctx context.Context, p provider.Provider, model string, cfg *config.Config, agent config.AgentConfig, diffChunks []string, coverageSummary string, previousReport string) (review.SeveritySummary, string, error) {
 	var combined review.SeveritySummary
 	var combinedText strings.Builder
 
@@ -248,7 +298,8 @@ func runAgentChunks(ctx context.Context, p provider.Provider, model string, cfg 
 		}
 
 		slog.Info("agent chunk", "subagent", agent.Subagent, "chunk", i+1, "total", len(diffChunks))
-		prompt := review.BuildPrompt(cfg, agent, chunk, coverageSummary)
+		chunkNote := review.ChunkNote(i+1, len(diffChunks))
+		prompt := review.BuildPrompt(cfg, agent, chunk, coverageSummary, chunkNote, previousReport)
 
 		resp, err := p.Generate(ctx, model, prompt)
 		if err != nil {

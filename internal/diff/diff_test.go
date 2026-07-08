@@ -79,8 +79,12 @@ diff --git a/src/main.go b/src/main.go
 	}
 }
 
-func TestCompute_truncation(t *testing.T) {
-	// Create a temporary git repo with a large file.
+// TestCompute_noWholeDiffTruncation guards against regressing to the old
+// behavior: Compute must return a large diff in full and leave chunking to
+// diff.ChunkFiles (via the caller), not truncate it itself. A whole-diff
+// cutoff here silently drops files from every downstream chunk, not just
+// the last one — see the comment on Compute for the full story.
+func TestCompute_noWholeDiffTruncation(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 
@@ -98,6 +102,8 @@ func TestCompute_truncation(t *testing.T) {
 	run("git", "config", "user.email", "test@test.com")
 	run("git", "config", "user.name", "Test")
 
+	// 600KB of changed content — comfortably larger than the old 100KB
+	// whole-diff cutoff, to prove it's gone.
 	f := filepath.Join(dir, "large.txt")
 	data := make([]byte, 600000)
 	for i := range data {
@@ -132,11 +138,14 @@ func TestCompute_truncation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Compute error: %v", err)
 	}
-	if len(d) > maxDiffSize+200 {
-		t.Errorf("diff not truncated: got %d bytes, max %d", len(d), maxDiffSize)
+	if len(d) < 1_000_000 {
+		t.Errorf("expected the full ~1.2MB diff (both old and new 600KB sides), got %d bytes — looks truncated", len(d))
 	}
-	if !strings.Contains(d, "[diff truncated") {
-		t.Error("diff missing truncation warning")
+	if strings.Contains(d, "[diff truncated") {
+		t.Error("Compute should never truncate; that's ChunkFiles' job now")
+	}
+	if !strings.Contains(d, "-"+strings.Repeat("a", 100)) || !strings.Contains(d, "+"+strings.Repeat("b", 100)) {
+		t.Error("diff missing content from both sides — looks truncated mid-file")
 	}
 }
 

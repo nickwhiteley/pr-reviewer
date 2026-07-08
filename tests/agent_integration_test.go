@@ -40,7 +40,7 @@ Found a critical SQL injection issue.`}},
 		SecurityLevel:    "Low",
 	}
 	agent := config.AgentConfig{Subagent: "security-auditor"}
-	prompt := review.BuildPrompt(cfg, agent, "diff content", "")
+	prompt := review.BuildPrompt(cfg, agent, "diff content", "", "", "")
 
 	resp, err := ollama.Generate(context.Background(), "test-model", prompt)
 	if err != nil {
