@@ -16,7 +16,19 @@ import (
 const (
 	anthropicEndpoint = "https://api.anthropic.com/v1/messages"
 	anthropicVersion  = "2023-06-01"
+	anthropicModel    = "claude-sonnet-4-6"
+
+	// anthropicContextTokens is the standard Claude context window.
+	anthropicContextTokens = 200000
+	// anthropicMaxTokens is the response cap; keep it and ResponseTokens in
+	// step so the prompt budget reserves what the response may actually use.
+	anthropicMaxTokens = 8192
 )
+
+// PromptBudgetBytes implements Provider.
+func (a *AnthropicProvider) PromptBudgetBytes(string) int {
+	return (anthropicContextTokens - anthropicMaxTokens) * BytesPerToken
+}
 
 // AnthropicProvider sends prompts to the Anthropic Messages API.
 type AnthropicProvider struct {
@@ -35,12 +47,12 @@ func NewAnthropicProvider() *AnthropicProvider {
 // Generate sends a prompt to the Anthropic Messages API and returns the response.
 func (a *AnthropicProvider) Generate(ctx context.Context, model string, prompt string) (Response, error) {
 	if model == "" {
-		model = "claude-sonnet-4-6"
+		model = anthropicModel
 	}
 
 	payload := map[string]any{
 		"model":      model,
-		"max_tokens": 8096,
+		"max_tokens": anthropicMaxTokens,
 		"messages": []map[string]string{
 			{"role": "user", "content": prompt},
 		},

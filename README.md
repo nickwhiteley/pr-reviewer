@@ -12,8 +12,8 @@ Every merge to `main` publishes a new binary release automatically.
 2. Computes the diff between base and head commits (excluding vendored files, lock files, generated code)
 3. Runs ticked hygiene checks deterministically — no AI required
 4. Gathers review context: the PR title and description, human discussion on the PR, the full contents of changed files, and a repository file listing — so agents judge the change in context instead of guessing from hunks
-5. Splits large diffs into 50 KB chunks and runs each configured AI agent in parallel; agents report **structured findings** (file, line, severity, rationale, suggested fix)
-6. Runs a **verification pass** on each agent's draft findings, dismissing anything speculative or explained as intentional (dismissals are listed in the report for auditability)
+5. Splits the diff into chunks sized against the model's context window, then runs every agent×chunk pair through a shared worker pool (`--concurrency`); agents report **structured findings** (file, line, severity, rationale, suggested fix)
+6. Runs a **verification pass** on the critical/high findings — the ones that gate the check — dismissing anything speculative or explained as intentional (dismissals are listed in the report for auditability). Medium/low findings are published without it and marked as such
 7. Posts (or updates) a comment per agent on the pull request, plus **inline review comments** on the exact lines where findings map to the diff
 8. Exits with code `1` if any verified finding is critical or high severity — or, by default, if the review itself could not complete (see fail modes)
 
@@ -28,6 +28,18 @@ Reviews respect the author's stated intent, from three sources:
 ### Fail modes
 
 By default the tool **fails closed**: if agents error out, time out, or return unparseable results, the check fails — a green tick always means the code was actually reviewed. Set `--fail-mode open` to make infrastructure failures advisory (exit 0) while still failing on critical/high findings.
+
+On timeout, whatever findings the agents had already produced are still posted, and each report names the files that were not reviewed. The check still fails in closed mode — a partial review is not a pass — but the work already done isn't discarded.
+
+### Large pull requests
+
+Every chunk is a separate provider round-trip, so chunk count, not diff size, is what drives review time. Three things keep it bounded:
+
+- **Chunks are sized from the model's context window**, not a fixed constant. Kimi K2.6's 262K-token window comfortably holds a 150 KB diff chunk plus file context, so most PRs are a single call per agent. A model with a smaller window automatically gets smaller chunks and less file context rather than a prompt the server would silently truncate.
+- **Agent×chunk pairs run through one shared worker pool.** Raising `--concurrency` shortens large reviews directly; lower it if you hit provider rate limits.
+- **Verification runs only on gating findings**, halving the call count on typical PRs.
+
+Nothing is dropped to save time: the whole diff is always chunked and reviewed, oversized files are split at hunk boundaries rather than truncated, and if the budget runs out the report says which files it missed. If reviews still time out, raise `--review-timeout` and `--concurrency` before considering `--verify=false` or `--file-context=false`.
 
 ---
 
@@ -97,6 +109,8 @@ Run `check-config` in CI (or a pre-commit hook) on repos that edit their `PR-REV
 | `--inline-comments` | true | Post findings as inline review comments on diff lines |
 | `--file-context` | true | Include full changed-file contents (budgeted) in prompts |
 | `--review-timeout` | 600 | Seconds allowed for the AI review phase (0 = unlimited) |
+| `--concurrency` | 6 | Maximum provider calls in flight at once, across all agents and chunks |
+| `--max-chunk-bytes` | 0 | Override the per-chunk diff byte ceiling (0 = derive from the model's context window) |
 | `--skip-agents` | false | Run hygiene checks only, skip AI agents |
 | `--dry-run` | false | Print reports to stdout instead of posting (only `--base`/`--head` required) |
 | `--coverage-file` | | Path to `go tool cover -func` output to include in prompts |
@@ -219,6 +233,7 @@ jobs:
           api-key: ${{ secrets.OLLAMA_API_KEY }}
           # provider: anthropic          # optional overrides
           # fail-mode: open
+          # concurrency: "10"            # more calls in flight on big PRs
           # extra-args: --verify=false
 ```
 

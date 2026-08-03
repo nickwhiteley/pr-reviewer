@@ -43,8 +43,15 @@ func main() {
 		inline        = flag.Bool("inline-comments", true, "Post findings as inline PR review comments where they map to diff lines")
 		fileContext   = flag.Bool("file-context", true, "Include full changed-file contents (budgeted) in agent prompts")
 		dryRun        = flag.Bool("dry-run", false, "Print reports to stdout instead of posting to GitHub (no --pr/--repo needed)")
+		concurrency   = flag.Int("concurrency", 6, "Maximum provider calls in flight at once across all agents and chunks")
+		maxChunkBytes = flag.Int("max-chunk-bytes", 0, "Override the per-chunk diff byte ceiling (0 = derive from the model's context window)")
 	)
 	flag.Parse()
+
+	if *concurrency < 1 {
+		fmt.Fprintf(os.Stderr, "invalid --concurrency %d: must be at least 1\n", *concurrency)
+		os.Exit(1)
+	}
 
 	if *failMode != "closed" && *failMode != "open" {
 		fmt.Fprintf(os.Stderr, "invalid --fail-mode %q: must be closed or open\n", *failMode)
@@ -160,43 +167,32 @@ func main() {
 		return
 	}
 
-	// Prepare diff chunks. diff.Compute returns the full diff, untruncated —
-	// chunking (not a whole-diff byte cutoff) is what handles large PRs, so
-	// that no file is ever silently invisible to every chunk. The only cap
-	// left is on the NUMBER of chunks actually sent to a provider, below,
-	// which is a cost/time control, not a correctness one, and reports
-	// honestly what it skipped.
-	var diffChunks []string
-	if len(prDiff) <= diff.MaxChunkSize {
-		diffChunks = []string{prDiff}
-	} else {
-		files := diff.SplitFiles(prDiff)
-		chunks := diff.ChunkFiles(files, diff.MaxChunkSize)
-		slog.Info("diff chunked", "files", len(files), "chunks", len(chunks))
-		for i, c := range chunks {
-			diffChunks = append(diffChunks, strings.Join(c, "\n"))
-			slog.Debug("chunk size", "chunk", i, "bytes", len(diffChunks[i]))
-		}
+	// Size the prompt sections against what the chosen model can actually
+	// accept, then chunk the diff to fit. diff.Compute returns the full diff,
+	// untruncated, and chunking now covers all of it: there is no cap on
+	// chunk count and no per-file byte cutoff, so nothing is dropped from the
+	// review. Wall-clock cost is controlled by running chunks concurrently
+	// (see the worker pool below) rather than by discarding content.
+	budget := newPromptBudget(p.PromptBudgetBytes(*model))
+	if *maxChunkBytes > 0 {
+		budget.chunk = *maxChunkBytes
 	}
 
-	// Cap the number of chunks actually reviewed per agent — a genuinely
-	// pathological diff (accidentally-committed vendor dump, huge generated
-	// file that slipped past exclusions, etc.) shouldn't turn into dozens of
-	// sequential provider calls per agent. Unlike the old whole-diff byte
-	// truncation this removed, it's honest about what it skips instead of
-	// silently cutting content off mid-file and letting an agent guess.
-	const maxChunksPerAgent = 12
-	var skippedChunksNote string
-	if len(diffChunks) > maxChunksPerAgent {
-		slog.Warn("diff has more chunks than the per-agent cap; skipping the rest",
-			"total_chunks", len(diffChunks), "cap", maxChunksPerAgent)
-		skippedChunksNote = fmt.Sprintf(
-			"\n\n---\n\n**Note**: this PR's diff produced %d chunks; only the first %d were reviewed "+
-				"(cost/time cap per agent). Files beyond that point were not reviewed by this tool. "+
-				"Consider splitting this PR, or request a manual review of the remaining files.\n",
-			len(diffChunks), maxChunksPerAgent,
-		)
-		diffChunks = diffChunks[:maxChunksPerAgent]
+	diffChunks := diff.Chunk(prDiff, budget.chunk)
+	slog.Info("diff chunked", "chunks", len(diffChunks), "diff_bytes", len(prDiff),
+		"chunk_ceiling", budget.chunk)
+	for i, c := range diffChunks {
+		slog.Debug("chunk size", "chunk", i, "bytes", len(c))
+	}
+
+	// The full content of each chunk's changed files, built ONCE per chunk
+	// and shared by every agent. This used to be rebuilt inside each agent's
+	// loop, re-reading the same files off disk once per agent per chunk.
+	chunkFileContext := make([]string, len(diffChunks))
+	if *fileContext {
+		for i, c := range diffChunks {
+			chunkFileContext[i] = buildFileContext(diff.FilePaths(c), budget.fileContext)
+		}
 	}
 
 	// Fetch existing PR comments once, up front, so each agent can see its
@@ -216,7 +212,7 @@ func main() {
 		marker := fmt.Sprintf("<!-- wd-auto-review:agent=%s -->", agent.Subagent)
 		for _, cm := range existingComments {
 			if strings.Contains(cm.Body, marker) {
-				return cm.Body
+				return clip(cm.Body, maxPreviousReportBytes, "previous report")
 			}
 		}
 		return ""
@@ -255,11 +251,11 @@ func main() {
 
 	// Shared prompt input for every agent and chunk; per-chunk fields
 	// (Agent, Diff, ChunkNote, PreviousReport, FileContext) are filled in
-	// runAgentChunks. Everything here is best-effort context: a fetch
-	// failure degrades the review, it doesn't abort it.
+	// runChunk. Everything here is best-effort context: a fetch failure
+	// degrades the review, it doesn't abort it.
 	basePrompt := review.PromptInput{
 		Cfg:             cfg,
-		CoverageSummary: coverageSummary,
+		CoverageSummary: clip(coverageSummary, maxCoverageBytes, "coverage summary"),
 		Discussion:      buildDiscussion(existingComments, reviewComments),
 		Suppressions:    diff.Suppressions(prDiff),
 	}
@@ -288,87 +284,151 @@ func main() {
 	}
 	defer reviewCancel()
 
-	// Run code review agents in parallel.
-	// Each agent is independent — a failure in one does not cancel the others.
-	var (
-		wg                sync.WaitGroup
-		mu                sync.Mutex
-		hasCriticalOrHigh bool
-		failedAgents      int
-		unverifiedAgents  int
-	)
-
-	for _, agent := range cfg.Agents {
-		wg.Add(1)
-		go func(agent config.AgentConfig) {
-			defer wg.Done()
-
-			slog.Info("running agent", "subagent", agent.Subagent, "chunks", len(diffChunks), "provider", *providerName, "model", *model)
-			previousReport := previousReportFor(agent)
-			outcome, err := runAgentChunks(reviewCtx, p, *model, basePrompt, agent, diffChunks, previousReport, *verify, *fileContext)
-			if err != nil {
-				// If the review context expired, suppress individual failure comments —
-				// a single timeout comment will be posted after all goroutines finish.
-				if reviewCtx.Err() != nil {
-					mu.Lock()
-					failedAgents++
-					mu.Unlock()
-					return
-				}
-
-				slog.Error("agent failed", "subagent", agent.Subagent, "error", err)
-
-				failureReport := review.FormatAgentFailureReport(agent, err)
-				marker := fmt.Sprintf("<!-- wd-auto-review:agent=%s -->", agent.Subagent)
-				if postErr := sink.PostOrUpdate(ctx, *prNum, marker, failureReport); postErr != nil {
-					slog.Error("failed to post agent failure comment", "subagent", agent.Subagent, "error", postErr)
-				}
-
-				mu.Lock()
-				failedAgents++
-				mu.Unlock()
-				return
-			}
-
-			mu.Lock()
-			if outcome.summary.Critical > 0 || outcome.summary.High > 0 {
-				hasCriticalOrHigh = true
-			}
-			if outcome.parseFailures > 0 {
-				unverifiedAgents++
-			}
-			mu.Unlock()
-
-			body := review.RenderFindings(outcome.findings, outcome.dismissed, outcome.notes)
-			for _, raw := range outcome.fallbackTexts {
-				body += "\n\n---\n\n### Unstructured agent output\n\n" + raw + "\n"
-			}
-			if outcome.parseFailures > 0 {
-				body += fmt.Sprintf(
-					"\n\n---\n\n⚠️ **Results could not be parsed for %d of %d chunk(s)** — any findings there are "+
-						"shown as raw output above but are NOT reflected in the severity summary. Treat this review as incomplete.\n",
-					outcome.parseFailures, len(diffChunks),
-				)
-			}
-
-			report := review.FormatAgentReport(agent, outcome.summary, body+skippedChunksNote)
-			marker := fmt.Sprintf("<!-- wd-auto-review:agent=%s -->", agent.Subagent)
-			if err := sink.PostOrUpdate(ctx, *prNum, marker, report); err != nil {
-				slog.Error("failed to post agent comment", "subagent", agent.Subagent, "error", err)
-				// Do not fail the pipeline for posting errors; the review result is still valid.
-			}
-
-			if poster != nil {
-				poster.post(ctx, agent.Subagent, outcome.findings)
-			}
-		}(agent)
+	// Schedule every (agent, chunk) pair through one bounded worker pool.
+	//
+	// Agents used to run concurrently while each walked its own chunks
+	// serially, so wall-clock time was chunkCount × (review + verify) latency
+	// no matter how many agents there were — adding agents bought nothing and
+	// the runner spent most of the review idle. Scheduling the whole
+	// agent×chunk grid keeps --concurrency calls in flight instead, which is
+	// what stops large PRs from running past --review-timeout.
+	// Ordered chunk-major (every agent's chunk 0, then every agent's chunk 1,
+	// …) rather than agent-major. If the budget does run out, coverage then
+	// degrades uniformly — all agents have seen the same early chunks —
+	// instead of leaving the last agent with nothing reviewed at all.
+	type work struct{ agent, chunk int }
+	var queue []work
+	for c := range diffChunks {
+		for a := range cfg.Agents {
+			queue = append(queue, work{a, c})
+		}
 	}
 
+	outcomes := make([]agentOutcome, len(cfg.Agents))
+	previousReports := make([]string, len(cfg.Agents))
+	for i, agent := range cfg.Agents {
+		outcomes[i].done = make(map[int]bool)
+		previousReports[i] = previousReportFor(agent)
+	}
+
+	var mu sync.Mutex
+	jobs := make(chan work)
+	workers := min(*concurrency, len(queue))
+
+	slog.Info("scheduling review", "agents", len(cfg.Agents), "chunks", len(diffChunks),
+		"calls", len(queue), "workers", workers, "provider", *providerName, "model", *model)
+
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Go(func() {
+			for w := range jobs {
+				if reviewCtx.Err() != nil {
+					return
+				}
+				res := runChunk(reviewCtx, p, *model, basePrompt, cfg.Agents[w.agent], chunkInput{
+					diff:        diffChunks[w.chunk],
+					fileContext: chunkFileContext[w.chunk],
+					index:       w.chunk,
+					total:       len(diffChunks),
+					previous:    previousReports[w.agent],
+				}, *verify)
+
+				mu.Lock()
+				outcomes[w.agent].merge(w.chunk, res)
+				mu.Unlock()
+			}
+		})
+	}
+
+dispatch:
+	for _, w := range queue {
+		select {
+		case jobs <- w:
+		case <-reviewCtx.Done():
+			break dispatch
+		}
+	}
+	close(jobs)
 	wg.Wait()
 
-	// If the review timed out, post a single comment. In closed mode this
-	// fails the check: an unreviewed PR must not show green (spec FR-013).
-	if errors.Is(reviewCtx.Err(), context.DeadlineExceeded) {
+	timedOut := errors.Is(reviewCtx.Err(), context.DeadlineExceeded)
+
+	// Publish whatever each agent managed to collect, even on timeout. The
+	// previous behaviour discarded every finding an agent had already
+	// produced and posted only a timeout notice, throwing away most of a
+	// review that had run for minutes.
+	var (
+		hasCriticalOrHigh bool
+		failedAgents      int
+		partialAgents     int
+	)
+	for i, agent := range cfg.Agents {
+		out := &outcomes[i]
+		out.finalize(*verify)
+
+		// An agent that completed nothing has no findings worth posting; it
+		// gets a failure comment instead. On timeout the single timeout
+		// notice below covers it, so don't spam one comment per agent.
+		if len(out.done) == 0 {
+			failedAgents++
+			if !timedOut {
+				err := out.err
+				if err == nil {
+					err = errors.New("agent produced no result for any diff chunk")
+				}
+				slog.Error("agent failed", "subagent", agent.Subagent, "error", err)
+				marker := fmt.Sprintf("<!-- wd-auto-review:agent=%s -->", agent.Subagent)
+				if postErr := sink.PostOrUpdate(ctx, *prNum, marker, review.FormatAgentFailureReport(agent, err)); postErr != nil {
+					slog.Error("failed to post agent failure comment", "subagent", agent.Subagent, "error", postErr)
+				}
+			}
+			continue
+		}
+
+		if out.summary.Critical > 0 || out.summary.High > 0 {
+			hasCriticalOrHigh = true
+		}
+		unreviewed := out.unreviewedFiles(diffChunks)
+		if len(unreviewed) > 0 || out.parseFailures > 0 {
+			partialAgents++
+		}
+
+		var body strings.Builder
+		body.WriteString(review.RenderFindings(out.findings, out.dismissed, out.notes))
+		for _, raw := range out.fallbackTexts {
+			fmt.Fprintf(&body, "\n\n---\n\n### Unstructured agent output\n\n%s\n", raw)
+		}
+		if out.parseFailures > 0 {
+			fmt.Fprintf(&body,
+				"\n\n---\n\n⚠️ **Results could not be parsed for %d of %d chunk(s)** — any findings there are "+
+					"shown as raw output above but are NOT reflected in the severity summary. Treat this review as incomplete.\n",
+				out.parseFailures, len(diffChunks),
+			)
+		}
+		if *verify && out.unverifiedFindings > 0 {
+			fmt.Fprintf(&body,
+				"\n\n---\n\nℹ️ %d medium/low finding(s) were published without a verification pass. "+
+					"Verification runs on critical/high findings — the ones that gate this check — to keep the "+
+					"review inside its time budget.\n", out.unverifiedFindings)
+		}
+		body.WriteString(formatCoverageNote(unreviewed, timedOut))
+
+		report := review.FormatAgentReport(agent, out.summary, body.String())
+		marker := fmt.Sprintf("<!-- wd-auto-review:agent=%s -->", agent.Subagent)
+		if err := sink.PostOrUpdate(ctx, *prNum, marker, report); err != nil {
+			slog.Error("failed to post agent comment", "subagent", agent.Subagent, "error", err)
+			// Do not fail the pipeline for posting errors; the review result is still valid.
+		}
+
+		if poster != nil {
+			poster.post(ctx, agent.Subagent, out.findings)
+		}
+	}
+
+	// A timeout still fails the check in closed mode: an incompletely
+	// reviewed PR must not show green (spec FR-013). The difference is that
+	// the partial findings are now on the PR alongside the notice.
+	if timedOut {
 		timeoutReport := formatTimeoutReport(*reviewTimeout, *providerName, failClosed)
 		if postErr := sink.PostOrUpdate(ctx, *prNum, "<!-- wd-auto-review:type=timeout -->", timeoutReport); postErr != nil {
 			slog.Error("failed to post timeout comment", "error", postErr)
@@ -385,18 +445,41 @@ func main() {
 		slog.Info("review complete with critical/high findings")
 		os.Exit(1)
 	}
-	if failedAgents > 0 || unverifiedAgents > 0 {
+	if failedAgents > 0 || partialAgents > 0 {
 		if failClosed {
 			slog.Error("review incomplete — failing check (fail-mode=closed)",
-				"failed_agents", failedAgents, "unverified_agents", unverifiedAgents)
+				"failed_agents", failedAgents, "partial_agents", partialAgents)
 			os.Exit(1)
 		}
 		slog.Info("review incomplete — exiting 0 (fail-mode=open)",
-			"failed_agents", failedAgents, "unverified_agents", unverifiedAgents)
+			"failed_agents", failedAgents, "partial_agents", partialAgents)
 		return
 	}
 
 	slog.Info("review complete")
+}
+
+// formatCoverageNote names the files an agent never got to, so a partial
+// review says exactly what it did not look at rather than implying the whole
+// diff was covered.
+func formatCoverageNote(unreviewed []string, timedOut bool) string {
+	if len(unreviewed) == 0 {
+		return ""
+	}
+	cause := "these chunks did not complete"
+	if timedOut {
+		cause = "the review ran out of time before reaching them"
+	}
+	const maxListed = 40
+	listed := unreviewed
+	suffix := ""
+	if len(listed) > maxListed {
+		suffix = fmt.Sprintf("\n- …and %d more", len(listed)-maxListed)
+		listed = listed[:maxListed]
+	}
+	return fmt.Sprintf(
+		"\n\n---\n\n⚠️ **Incomplete coverage** — %d file(s) in this PR were NOT reviewed by this agent (%s):\n\n- %s%s\n",
+		len(unreviewed), cause, strings.Join(listed, "\n- "), suffix)
 }
 
 // formatTimeoutReport returns a PR comment body explaining that the review timed out.
@@ -416,7 +499,25 @@ The AI review agents did not complete within the configured timeout (%ds via the
 `, timeoutSecs, providerName, consequence)
 }
 
+// promptBudget divides a provider's usable prompt bytes across the sections
+// of an agent prompt that can grow with PR size. Deriving these from the
+// model's own window keeps a big diff inside the context instead of relying
+// on constants tuned for one particular model.
+type promptBudget struct {
+	chunk       int // diff bytes per chunk
+	fileContext int // bytes of full changed-file content
+}
+
+func newPromptBudget(total int) promptBudget {
+	return promptBudget{
+		chunk:       min(max(total*60/100, diff.MinChunkSize), diff.MaxChunkSize),
+		fileContext: min(total*25/100, maxFileContextBytes),
+	}
+}
+
 // agentOutcome is the combined result of one agent across all diff chunks.
+// Chunks land in it concurrently and out of order, so everything here is
+// accumulated rather than assumed sequential.
 type agentOutcome struct {
 	summary   review.SeveritySummary
 	findings  []review.Finding
@@ -428,85 +529,176 @@ type agentOutcome struct {
 	// parseFailures counts chunks whose response yielded neither findings
 	// nor a legacy severity block — unverifiable output.
 	parseFailures int
+	// legacy accumulates severity counts from responses that used the old
+	// severity-block format instead of structured findings.
+	legacy review.SeveritySummary
+	// done records which chunk indices this agent actually completed, so a
+	// partial review can name what it never looked at.
+	done map[int]bool
+	// unverifiedFindings counts published findings that skipped the
+	// verification pass because they were below the gating severity. Set by
+	// finalize, after dedupe, so it matches what the reader actually sees.
+	unverifiedFindings int
+	// err is the first hard error seen; only reported when nothing completed.
+	err error
 }
 
-// runAgentChunks processes all diff chunks for a single agent and combines results.
-// Chunks are processed sequentially within an agent to avoid overwhelming the provider.
-// previousReport is this same agent's report from an earlier run on this PR (empty if
-// none), passed into every chunk's prompt so the agent can avoid blindly re-raising
-// findings that were already fixed or explained. When verify is true, each chunk's
-// findings go through a second self-verification pass that drops unsupported ones.
-func runAgentChunks(ctx context.Context, p provider.Provider, model string, base review.PromptInput, agent config.AgentConfig, diffChunks []string, previousReport string, verify bool, fileContext bool) (agentOutcome, error) {
-	var out agentOutcome
-	var legacySummary review.SeveritySummary
+// chunkResult is one agent's result for one diff chunk.
+type chunkResult struct {
+	findings     []review.Finding
+	dismissed    []review.Dismissed
+	notes        string
+	fallbackText string
+	parseFailure bool
+	legacy       review.SeveritySummary
+	err          error
+}
 
-	for i, chunk := range diffChunks {
-		if ctx.Err() != nil {
-			return out, ctx.Err()
+// merge folds one chunk's result into the agent's accumulated outcome.
+func (o *agentOutcome) merge(chunk int, r chunkResult) {
+	if r.err != nil {
+		if o.err == nil {
+			o.err = r.err
 		}
+		return
+	}
+	o.done[chunk] = true
+	o.findings = append(o.findings, r.findings...)
+	o.dismissed = append(o.dismissed, r.dismissed...)
+	o.fallbackTexts = append(o.fallbackTexts, nonEmpty(r.fallbackText)...)
+	o.notes = append(o.notes, nonEmpty(r.notes)...)
+	if r.parseFailure {
+		o.parseFailures++
+	}
+	o.legacy.Critical += r.legacy.Critical
+	o.legacy.High += r.legacy.High
+	o.legacy.Medium += r.legacy.Medium
+	o.legacy.Low += r.legacy.Low
+}
 
-		slog.Info("agent chunk", "subagent", agent.Subagent, "chunk", i+1, "total", len(diffChunks))
-		in := base
-		in.Agent = agent
-		in.Diff = chunk
-		in.ChunkNote = review.ChunkNote(i+1, len(diffChunks))
-		in.PreviousReport = previousReport
-		if fileContext {
-			in.FileContext = buildFileContext(diff.FilePaths(chunk))
-		}
-		prompt := review.BuildPrompt(in)
+// finalize dedupes findings and computes the severity summary. Ordering is
+// restored here because chunks complete concurrently. verify reports whether
+// the verification pass was enabled, which decides whether the surviving
+// medium/low findings are worth flagging as unverified.
+func (o *agentOutcome) finalize(verify bool) {
+	o.findings = review.DedupeFindings(o.findings)
+	if verify {
+		_, advisory := partitionGating(o.findings)
+		o.unverifiedFindings = len(advisory)
+	}
+	o.summary = review.SummaryFromFindings(o.findings)
+	o.summary.Critical += o.legacy.Critical
+	o.summary.High += o.legacy.High
+	o.summary.Medium += o.legacy.Medium
+	o.summary.Low += o.legacy.Low
+}
 
-		resp, err := p.Generate(ctx, model, prompt)
-		if err != nil {
-			return out, fmt.Errorf("chunk %d: %w", i+1, err)
-		}
-
-		findings, notes, err := review.ParseFindings(resp.Text)
-		if err != nil {
-			// No findings block. Accept a legacy severity-count block so a
-			// model that ignored the format still gates correctly; anything
-			// else is unverifiable and counted, not swallowed — it must not
-			// silently read as "no issues found".
-			if summary, _, serr := review.ParseSeverity(resp.Text); serr == nil {
-				legacySummary.Critical += summary.Critical
-				legacySummary.High += summary.High
-				legacySummary.Medium += summary.Medium
-				legacySummary.Low += summary.Low
-			} else {
-				out.parseFailures++
-				slog.Warn("could not parse agent response", "subagent", agent.Subagent, "chunk", i+1, "error", err)
-			}
-			out.fallbackTexts = append(out.fallbackTexts, resp.Text)
+// unreviewedFiles returns the files in chunks this agent never completed.
+// A file split across several chunks may have been partly reviewed, so it is
+// listed once and only when at least one of its chunks was missed.
+func (o *agentOutcome) unreviewedFiles(diffChunks []string) []string {
+	var files []string
+	seen := make(map[string]bool)
+	for i, c := range diffChunks {
+		if o.done[i] {
 			continue
 		}
-
-		if verify && len(findings) > 0 {
-			verified, dismissed, verr := verifyFindings(ctx, p, model, agent, chunk, findings)
-			if verr != nil {
-				slog.Warn("verification pass failed; keeping unverified findings",
-					"subagent", agent.Subagent, "chunk", i+1, "error", verr)
-			} else {
-				slog.Info("verification pass", "subagent", agent.Subagent, "chunk", i+1,
-					"draft", len(findings), "kept", len(verified), "dismissed", len(dismissed))
-				findings = verified
-				out.dismissed = append(out.dismissed, dismissed...)
+		for _, f := range diff.FilePaths(c) {
+			if !seen[f] {
+				seen[f] = true
+				files = append(files, f)
 			}
 		}
+	}
+	return files
+}
 
-		out.findings = append(out.findings, findings...)
-		if notes != "" {
-			out.notes = append(out.notes, notes)
+func nonEmpty(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return []string{s}
+}
+
+// chunkInput is the per-chunk half of a review prompt.
+type chunkInput struct {
+	diff        string
+	fileContext string
+	index       int // 0-based
+	total       int
+	previous    string
+}
+
+// runChunk performs one agent's review of one diff chunk: the review call,
+// plus a verification call when the chunk produced findings that would gate
+// the check.
+func runChunk(ctx context.Context, p provider.Provider, model string, base review.PromptInput, agent config.AgentConfig, c chunkInput, verify bool) chunkResult {
+	slog.Info("agent chunk", "subagent", agent.Subagent, "chunk", c.index+1, "total", c.total)
+
+	in := base
+	in.Agent = agent
+	in.Diff = c.diff
+	in.ChunkNote = review.ChunkNote(c.index+1, c.total)
+	in.PreviousReport = c.previous
+	in.FileContext = c.fileContext
+
+	resp, err := p.Generate(ctx, model, review.BuildPrompt(in))
+	if err != nil {
+		return chunkResult{err: fmt.Errorf("chunk %d: %w", c.index+1, err)}
+	}
+
+	findings, notes, err := review.ParseFindings(resp.Text)
+	if err != nil {
+		// No findings block. Accept a legacy severity-count block so a model
+		// that ignored the format still gates correctly; anything else is
+		// unverifiable and counted, not swallowed — it must not silently read
+		// as "no issues found".
+		res := chunkResult{fallbackText: resp.Text}
+		if summary, _, serr := review.ParseSeverity(resp.Text); serr == nil {
+			res.legacy = summary
+		} else {
+			res.parseFailure = true
+			slog.Warn("could not parse agent response", "subagent", agent.Subagent, "chunk", c.index+1, "error", err)
+		}
+		return res
+	}
+
+	res := chunkResult{notes: notes}
+
+	// Verify only the findings that actually gate this check. The pass costs
+	// a full extra provider round-trip per chunk, and its value is filtering
+	// false positives out of results that fail CI — medium and low findings
+	// are advisory, so paying to re-examine them doubles review time for no
+	// change in outcome. They are published marked as unverified.
+	gating, advisory := partitionGating(findings)
+	if verify && len(gating) > 0 {
+		verified, dismissed, verr := verifyFindings(ctx, p, model, agent, c.diff, gating)
+		if verr != nil {
+			slog.Warn("verification pass failed; keeping unverified findings",
+				"subagent", agent.Subagent, "chunk", c.index+1, "error", verr)
+		} else {
+			slog.Info("verification pass", "subagent", agent.Subagent, "chunk", c.index+1,
+				"draft", len(gating), "kept", len(verified), "dismissed", len(dismissed))
+			gating = verified
+			res.dismissed = dismissed
 		}
 	}
 
-	out.findings = review.DedupeFindings(out.findings)
-	out.summary = review.SummaryFromFindings(out.findings)
-	out.summary.Critical += legacySummary.Critical
-	out.summary.High += legacySummary.High
-	out.summary.Medium += legacySummary.Medium
-	out.summary.Low += legacySummary.Low
+	res.findings = append(gating, advisory...)
+	return res
+}
 
-	return out, nil
+// partitionGating splits findings into those that fail the check
+// (critical/high) and those that are advisory (medium/low).
+func partitionGating(findings []review.Finding) (gating, advisory []review.Finding) {
+	for _, f := range findings {
+		if f.Severity == "critical" || f.Severity == "high" {
+			gating = append(gating, f)
+		} else {
+			advisory = append(advisory, f)
+		}
+	}
+	return gating, advisory
 }
 
 // verifyFindings runs the self-verification pass for one chunk's findings.

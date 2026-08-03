@@ -10,10 +10,48 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
-const defaultEndpoint = "https://ollama.com/api/chat"
+const (
+	defaultEndpoint = "https://ollama.com/api/chat"
+	defaultModel    = "kimi-k2.6:cloud"
+)
+
+// modelContextTokens is the context window, in tokens, of models we know
+// about. Anything not listed falls back to defaultContextTokens.
+var modelContextTokens = map[string]int{
+	"kimi-k2.6:cloud": 262144,
+	"kimi-k2.6":       262144,
+}
+
+// defaultContextTokens is the assumed window for an unrecognised model.
+// Deliberately modest: guessing low costs an extra chunk, guessing high
+// invites the server to silently drop the end of the prompt.
+const defaultContextTokens = 32768
+
+// contextTokens returns the context window for a model, ignoring any
+// ":cloud"-style tag suffix if the exact name isn't known.
+func contextTokens(model string) int {
+	if n, ok := modelContextTokens[model]; ok {
+		return n
+	}
+	if base, _, found := strings.Cut(model, ":"); found {
+		if n, ok := modelContextTokens[base]; ok {
+			return n
+		}
+	}
+	return defaultContextTokens
+}
+
+// PromptBudgetBytes implements Provider.
+func (o *OllamaProvider) PromptBudgetBytes(model string) int {
+	if model == "" {
+		model = defaultModel
+	}
+	return (contextTokens(model) - ResponseTokens) * BytesPerToken
+}
 
 // OllamaProvider sends prompts to the Ollama cloud API.
 type OllamaProvider struct {
@@ -50,15 +88,29 @@ func (o *OllamaProvider) SetEndpoint(url string) {
 // Generate sends a prompt to Ollama and returns the response.
 func (o *OllamaProvider) Generate(ctx context.Context, model string, prompt string) (Response, error) {
 	if model == "" {
-		model = "kimi-k2.6:cloud"
+		model = defaultModel
 	}
 
-	payload := map[string]interface{}{
+	// Ollama applies its own default context length (commonly far smaller
+	// than the model's real window) when num_ctx is absent, and it truncates
+	// an over-long prompt SILENTLY — the request succeeds and the model
+	// simply never sees the end of the diff. Ask for exactly what this
+	// prompt needs, and refuse rather than let the tail be dropped.
+	window := contextTokens(model)
+	needed := len(prompt)/BytesPerToken + ResponseTokens
+	if needed > window {
+		return Response{}, fmt.Errorf(
+			"prompt needs ~%d tokens but %s has a %d-token window; "+
+				"reduce the diff chunk size (--max-chunk-bytes)", needed, model, window)
+	}
+
+	payload := map[string]any{
 		"model": model,
 		"messages": []map[string]string{
 			{"role": "user", "content": prompt},
 		},
-		"stream": false,
+		"stream":  false,
+		"options": map[string]any{"num_ctx": needed},
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {

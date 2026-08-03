@@ -29,6 +29,12 @@ inputs:
   review-timeout:
     description: "Timeout in seconds for the AI review phase"
     default: "600"
+  concurrency:
+    description: >-
+      Maximum provider calls in flight at once, across all agents and diff
+      chunks. Raise it to shorten reviews of large PRs; lower it if the
+      provider rate-limits.
+    default: "6"
   version:
     description: "pr-reviewer release tag to install (e.g. v1.2.3), or latest"
     default: "latest"
@@ -81,4 +87,5 @@ runs:
           --config "${{ inputs.config }}" \
           --fail-mode "${{ inputs.fail-mode }}" \
           --review-timeout "${{ inputs.review-timeout }}" \
+          --concurrency "${{ inputs.concurrency }}" \
           $model_flag ${{ inputs.extra-args }}
