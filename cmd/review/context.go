@@ -17,7 +17,27 @@ const (
 	maxFileBytes        = 24 * 1024
 	maxFileContextBytes = 96 * 1024
 	maxRepoTreeBytes    = 8 * 1024
+
+	// maxPreviousReportBytes bounds the agent's own prior report. It is
+	// quoted verbatim into every chunk prompt, and it grows with each re-run
+	// as findings accumulate, so an uncapped one lets prompt size creep
+	// upward on exactly the PRs that are already slow — the ones being
+	// pushed to repeatedly.
+	maxPreviousReportBytes = 12 * 1024
+
+	// maxCoverageBytes bounds `go tool cover -func` output, which is one line
+	// per function and unbounded on a large repository.
+	maxCoverageBytes = 12 * 1024
 )
+
+// clip truncates s to at most n bytes, appending an explicit note so a
+// shortened section never looks complete to the agent reading it.
+func clip(s string, n int, what string) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + fmt.Sprintf("\n… [%s truncated at %d bytes]", what, n)
+}
 
 // buildDiscussion renders human PR conversation (issue comments and inline
 // review replies) for agent prompts, so explanations of intentional behavior
@@ -62,12 +82,16 @@ func buildDiscussion(comments []github.Comment, reviewComments []github.ReviewCo
 // the checked-out working tree, so agents see whole files instead of hunks.
 // Missing files (deleted in the PR), binaries, and budget overruns are
 // skipped or truncated with an explicit note — never silently.
-func buildFileContext(paths []string) string {
+//
+// budget is the byte allowance for this section, derived from the model's
+// context window (see promptBudget) rather than fixed, so a model with a
+// small window doesn't get a prompt it will quietly truncate.
+func buildFileContext(paths []string, budget int) string {
 	var b strings.Builder
 	var omitted []string
 
 	for _, p := range paths {
-		if b.Len() >= maxFileContextBytes {
+		if b.Len() >= budget {
 			omitted = append(omitted, p)
 			continue
 		}

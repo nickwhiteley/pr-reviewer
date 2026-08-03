@@ -2,6 +2,7 @@ package diff
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -177,11 +178,22 @@ index 789..abc 100644
 	}
 }
 
+// fileDiff builds a synthetic per-file diff with the given number of hunks,
+// each roughly hunkBytes long.
+func fileDiff(name string, hunks, hunkBytes int) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "diff --git a/%s b/%s\nindex 1111111..2222222 100644\n--- a/%s\n+++ b/%s\n", name, name, name, name)
+	for i := range hunks {
+		fmt.Fprintf(&b, "@@ -%d,3 +%d,4 @@\n+%s\n", i*10+1, i*10+1, strings.Repeat("x", hunkBytes))
+	}
+	return b.String()
+}
+
 func TestChunkFiles(t *testing.T) {
 	files := []string{
-		"diff --git a/small.go b/small.go\n+small\n",
-		strings.Repeat("x", 40000),
-		"diff --git a/medium.go b/medium.go\n+medium\n",
+		fileDiff("small.go", 1, 100),
+		fileDiff("big.go", 8, 5000),
+		fileDiff("medium.go", 1, 100),
 	}
 
 	chunks := ChunkFiles(files, 30000)
@@ -189,7 +201,6 @@ func TestChunkFiles(t *testing.T) {
 		t.Fatalf("expected at least 2 chunks, got %d", len(chunks))
 	}
 
-	// Verify each chunk is within limit
 	for i, c := range chunks {
 		var size int
 		for _, f := range c {
@@ -200,30 +211,139 @@ func TestChunkFiles(t *testing.T) {
 		}
 	}
 
-	// Verify all files are present
-	var totalFiles int
+	// Every added line must survive chunking somewhere — the whole point of
+	// splitting oversized files by hunk instead of truncating them.
+	var joined string
 	for _, c := range chunks {
-		totalFiles += len(c)
+		joined += strings.Join(c, "\n")
 	}
-	if totalFiles != len(files) {
-		t.Errorf("expected %d total files across chunks, got %d", len(files), totalFiles)
+	for _, want := range []string{"small.go", "big.go", "medium.go"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("chunks lost file %s", want)
+		}
+	}
+	if got, want := strings.Count(joined, "@@ -"), 10; got != want {
+		t.Errorf("expected all %d hunks preserved across chunks, got %d", want, got)
 	}
 }
 
 func TestChunkFiles_singleFileTooLarge(t *testing.T) {
-	files := []string{
-		strings.Repeat("x", 60000),
+	// One file bigger than the budget is split across chunks at hunk
+	// boundaries, not truncated: every hunk must still be reviewed.
+	files := []string{fileDiff("huge.go", 6, 10000)}
+
+	chunks := ChunkFiles(files, 25000)
+	if len(chunks) < 2 {
+		t.Fatalf("expected the oversized file to be split, got %d chunk(s)", len(chunks))
 	}
 
-	chunks := ChunkFiles(files, 50000)
-	if len(chunks) != 1 {
-		t.Fatalf("expected 1 chunk, got %d", len(chunks))
+	var joined string
+	for _, c := range chunks {
+		joined += strings.Join(c, "\n")
 	}
-	if len(chunks[0]) != 1 {
-		t.Fatalf("expected 1 file in chunk, got %d", len(chunks[0]))
+	if strings.Contains(joined, "[file truncated]") {
+		t.Error("oversized files must be split by hunk, never truncated")
 	}
-	if !strings.Contains(chunks[0][0], "[file truncated]") {
-		t.Error("expected truncation marker for oversized file")
+	if got, want := strings.Count(joined, "@@ -"), 6; got != want {
+		t.Errorf("expected %d hunks preserved, got %d", want, got)
+	}
+	// Each piece must carry the file header so it parses as a valid diff.
+	for _, c := range chunks {
+		for _, part := range c {
+			if !strings.HasPrefix(part, "diff --git a/huge.go") {
+				t.Errorf("split piece missing file header: %.60q", part)
+			}
+		}
+	}
+}
+
+func TestSplitFileByHunks_indivisible(t *testing.T) {
+	// A single hunk larger than the budget is emitted whole rather than cut
+	// mid-line: an over-budget prompt fails loudly, a truncated one hides
+	// code from the reviewer silently.
+	f := fileDiff("one.go", 1, 40000)
+	parts := splitFileByHunks(f, 10000)
+	if len(parts) != 1 {
+		t.Fatalf("expected 1 part for an indivisible hunk, got %d", len(parts))
+	}
+	if parts[0] != f {
+		t.Error("indivisible hunk must be passed through unmodified")
+	}
+}
+
+func TestSplitFileByHunks_noHunks(t *testing.T) {
+	// Binary files and pure renames have no hunks to split on.
+	f := "diff --git a/blob.bin b/blob.bin\nBinary files differ\n" + strings.Repeat("x", 5000)
+	parts := splitFileByHunks(f, 1000)
+	if len(parts) != 1 || parts[0] != f {
+		t.Errorf("expected hunkless input passed through unchanged, got %d part(s)", len(parts))
+	}
+}
+
+func TestChunkSizeFor(t *testing.T) {
+	tests := []struct {
+		name           string
+		total, ceiling int
+		wantChunks     int
+	}{
+		{"fits in one", 100 * 1024, 150 * 1024, 1},
+		{"just over ceiling splits evenly", 200 * 1024, 150 * 1024, 2},
+		{"large diff stays bounded", 900 * 1024, 150 * 1024, 6},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			size := ChunkSizeFor(tt.total, tt.ceiling)
+			if size > tt.ceiling {
+				t.Errorf("size %d exceeds ceiling %d", size, tt.ceiling)
+			}
+			got := (tt.total + size - 1) / size
+			if got != tt.wantChunks {
+				t.Errorf("expected %d chunks at size %d, got %d", tt.wantChunks, size, got)
+			}
+		})
+	}
+}
+
+func TestChunk_coversWholeDiffAndMinimisesChunks(t *testing.T) {
+	// Three 60KB files against a 150KB ceiling. Balanced sizing alone would
+	// target 80KB chunks and strand each file in its own chunk (3 calls);
+	// packing at the ceiling fits two files together (2 calls). Chunk must
+	// take the cheaper packing.
+	raw := fileDiff("a.go", 1, 60000) + fileDiff("b.go", 1, 60000) + fileDiff("c.go", 1, 60000)
+
+	chunks := Chunk(raw, 150*1024)
+	if len(chunks) != 2 {
+		t.Errorf("expected 2 chunks from the better packing, got %d", len(chunks))
+	}
+
+	joined := strings.Join(chunks, "\n")
+	for _, want := range []string{"a.go", "b.go", "c.go"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("chunking dropped %s", want)
+		}
+	}
+	for i, c := range chunks {
+		if len(c) > 150*1024 {
+			t.Errorf("chunk %d is %d bytes, over the ceiling", i, len(c))
+		}
+	}
+}
+
+func TestChunk_smallDiffStaysWhole(t *testing.T) {
+	raw := fileDiff("a.go", 1, 100)
+	chunks := Chunk(raw, 150*1024)
+	if len(chunks) != 1 || chunks[0] != raw {
+		t.Errorf("a diff under the ceiling must pass through as one chunk, got %d", len(chunks))
+	}
+}
+
+func TestChunkSizeFor_balances(t *testing.T) {
+	// 160KB against a 150KB ceiling should be two ~80KB chunks, not a 150KB
+	// chunk and a 10KB one: chunks run concurrently, so wall-clock time is
+	// set by the largest.
+	size := ChunkSizeFor(160*1024, 150*1024)
+	if size > 90*1024 {
+		t.Errorf("expected balanced chunks around 80KB, got %d bytes", size)
 	}
 }
 

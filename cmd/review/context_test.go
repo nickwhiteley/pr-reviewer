@@ -42,7 +42,7 @@ func TestBuildFileContext(t *testing.T) {
 	binFile := filepath.Join(dir, "blob.bin")
 	os.WriteFile(binFile, []byte{0x00, 0x01, 0x02}, 0o644)
 
-	out := buildFileContext([]string{textFile, binFile, filepath.Join(dir, "deleted.go")})
+	out := buildFileContext([]string{textFile, binFile, filepath.Join(dir, "deleted.go")}, maxFileContextBytes)
 
 	if !strings.Contains(out, "fence breaker") {
 		t.Errorf("missing text file content: %q", out)
