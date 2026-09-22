@@ -17,6 +17,7 @@ Every merge to `main` publishes a new binary release automatically.
 7. Posts (or updates) a comment per agent on the pull request, plus **inline review comments** on the exact lines where findings map to the diff
 8. Exits with code `1` if any verified finding is critical or high severity — or, by default, if the review itself could not complete (see fail modes)
 
+
 ### Intentional findings
 
 Reviews respect the author's stated intent, from three sources:
