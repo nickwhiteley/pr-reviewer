@@ -53,11 +53,11 @@ func ChunkSizeFor(totalBytes, ceiling int) int {
 	return max((totalBytes+chunks-1)/chunks, MinChunkSize)
 }
 
-// Excluded patterns that are skipped from the diff. Three forms are
-// supported (see excluded): "dir/" matches that directory at any depth,
-// "*.ext" glob-matches the file basename, anything else matches the
-// basename or the full path exactly.
-var exclusions = []string{
+// DefaultExclusions are skipped from every diff: generated code, vendored
+// trees, lockfiles, and the two files that configure this tool (quoting them
+// back at an agent is both noise and an injection surface). A repository adds
+// its own through the "Excluded Paths" section of PR-REVIEW.md.
+var DefaultExclusions = []string{
 	"vendor/",
 	"node_modules/",
 	"*.lock",
@@ -72,23 +72,42 @@ var exclusions = []string{
 	"CLAUDE.md",
 }
 
-// excluded reports whether a repo-relative file path matches an exclusion.
-func excluded(filePath string) bool {
+// Match reports whether a repo-relative file path matches any of the given
+// patterns. Four forms are supported:
+//
+//   - "dir/" or "dir/**" matches that directory at any depth
+//   - "a/b/*.go" (a pattern containing "/") is path.Match'd against the whole path
+//   - "*.ext" glob-matches the file basename
+//   - anything else matches the basename or the full path exactly
+//
+// An empty pattern list matches nothing; callers that mean "everything"
+// check for emptiness themselves, because the two need opposite defaults:
+// no exclusions excludes nothing, no path filter includes everything.
+func Match(filePath string, patterns []string) bool {
 	base := path.Base(filePath)
-	for _, ex := range exclusions {
+	for _, pat := range patterns {
+		pat = strings.TrimSpace(pat)
+		if pat == "" {
+			continue
+		}
+		pat = strings.TrimSuffix(pat, "**")
 		switch {
-		case strings.HasSuffix(ex, "/"):
+		case strings.HasSuffix(pat, "/"):
 			// Directory pattern: match at the root or any depth, but only on
 			// component boundaries so "dist/" doesn't catch "redist/".
-			if strings.HasPrefix(filePath, ex) || strings.Contains(filePath, "/"+ex) {
+			if strings.HasPrefix(filePath, pat) || strings.Contains(filePath, "/"+pat) {
 				return true
 			}
-		case strings.ContainsAny(ex, "*?["):
-			if ok, _ := path.Match(ex, base); ok {
+		case strings.Contains(pat, "/") && strings.ContainsAny(pat, "*?["):
+			if ok, _ := path.Match(pat, filePath); ok {
+				return true
+			}
+		case strings.ContainsAny(pat, "*?["):
+			if ok, _ := path.Match(pat, base); ok {
 				return true
 			}
 		default:
-			if base == ex || filePath == ex {
+			if base == pat || filePath == pat {
 				return true
 			}
 		}
@@ -125,7 +144,9 @@ func diffFilePath(line string) string {
 // number of *chunks* actually sent to a provider, which is the real cost
 // control and — unlike a raw byte cutoff — can honestly report what
 // wasn't reviewed instead of silently mangling file boundaries.
-func Compute(ctx context.Context, base, head string) (string, error) {
+// extra names repository-specific exclusions from PR-REVIEW.md, applied on
+// top of DefaultExclusions.
+func Compute(ctx context.Context, base, head string, extra []string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", "diff", base, head)
 	out, err := cmd.Output()
 	if err != nil {
@@ -135,16 +156,26 @@ func Compute(ctx context.Context, base, head string) (string, error) {
 		return "", fmt.Errorf("git diff: %w", err)
 	}
 
-	return filterDiff(string(out)), nil
+	return Filter(string(out), nil, append(append([]string{}, DefaultExclusions...), extra...)), nil
 }
 
-func filterDiff(raw string) string {
+// Filter keeps the files of a diff that match include (all of them when
+// include is empty) and do not match exclude. It works on whole files, so
+// the result is always a valid diff.
+//
+// This is what routes a chunk of the review to the agents it concerns:
+// filtering BEFORE chunking, rather than after, is what makes the saving
+// real. An agent scoped to `api/internal/store/` gets its own small diff
+// packed into its own chunks, instead of being handed every chunk of the
+// whole PR and asked to ignore most of each one.
+func Filter(raw string, include, exclude []string) string {
 	var out bytes.Buffer
 	var skipFile bool
 
 	for _, line := range strings.Split(raw, "\n") {
 		if strings.HasPrefix(line, "diff --git ") {
-			skipFile = excluded(diffFilePath(line))
+			p := diffFilePath(line)
+			skipFile = Match(p, exclude) || (len(include) > 0 && !Match(p, include))
 		}
 		if skipFile {
 			continue
@@ -420,4 +451,152 @@ func RepoTree(ctx context.Context, maxBytes int) (string, error) {
 	}
 	omitted := strings.Count(s[cut:], "\n") + 1
 	return s[:cut] + fmt.Sprintf("\n... (%d more files omitted)", omitted), nil
+}
+
+// Hunk is one hunk of one file's diff: the new-side line range it covers and
+// the raw text of the hunk itself, header included.
+type Hunk struct {
+	File  string
+	Start int // first new-side line number
+	End   int // last new-side line number (inclusive)
+	Text  string
+}
+
+// hunkHeaderPattern captures the new-side start and length from "@@ -a,b +c,d @@".
+// The length is optional: "@@ -1 +1 @@" means one line.
+var hunkHeaderPattern = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
+
+// Hunks returns every hunk in a diff, in order of appearance.
+//
+// Two things need this and neither wants the whole diff: the file-context
+// section, which shows the source around each hunk rather than whole files,
+// and the verification pass, which needs only the hunk a finding points at.
+func Hunks(raw string) []Hunk {
+	var hunks []Hunk
+	var file string
+	var cur *Hunk
+	var b strings.Builder
+
+	flush := func() {
+		if cur != nil {
+			cur.Text = b.String()
+			hunks = append(hunks, *cur)
+			cur = nil
+		}
+		b.Reset()
+	}
+
+	for _, line := range strings.Split(raw, "\n") {
+		switch {
+		case strings.HasPrefix(line, "diff --git "):
+			flush()
+			file = diffFilePath(line)
+		case strings.HasPrefix(line, "@@ "):
+			flush()
+			m := hunkHeaderPattern.FindStringSubmatch(line)
+			if m == nil || file == "" {
+				continue
+			}
+			start, _ := strconv.Atoi(m[1])
+			length := 1
+			if m[2] != "" {
+				length, _ = strconv.Atoi(m[2])
+			}
+			end := start + length - 1
+			if end < start {
+				// A pure deletion has length 0; it still anchors at start.
+				end = start
+			}
+			cur = &Hunk{File: file, Start: start, End: end}
+			b.WriteString(line)
+			b.WriteByte('\n')
+		default:
+			if cur != nil {
+				b.WriteString(line)
+				b.WriteByte('\n')
+			}
+		}
+	}
+	flush()
+	return hunks
+}
+
+// HunkRanges returns, per file, the new-side line ranges the diff touches.
+func HunkRanges(raw string) map[string][][2]int {
+	out := make(map[string][][2]int)
+	for _, h := range Hunks(raw) {
+		out[h.File] = append(out[h.File], [2]int{h.Start, h.End})
+	}
+	return out
+}
+
+// EvidenceFor returns a minimal diff containing only the hunks that cover the
+// given (file, line) locations, with each file's header repeated so the result
+// is a valid, self-describing diff.
+//
+// The verification pass used to be handed the whole chunk it came from —
+// 120KB of diff to re-examine three findings against. Verification asks one
+// question, "does a line here actually support this?", and the only lines
+// that can answer it are the ones the finding points at. Locations that fall
+// in no hunk are skipped: a finding that cannot be anchored has no evidence
+// to check, and the verifier is told to dismiss it on exactly those grounds.
+func EvidenceFor(raw string, locations map[string][]int) string {
+	headers := fileHeaders(raw)
+
+	var b strings.Builder
+	emitted := make(map[string]bool)
+	for _, h := range Hunks(raw) {
+		lines, ok := locations[h.File]
+		if !ok {
+			continue
+		}
+		hit := false
+		for _, l := range lines {
+			if l >= h.Start && l <= h.End {
+				hit = true
+				break
+			}
+		}
+		if !hit {
+			continue
+		}
+		if !emitted[h.File] {
+			emitted[h.File] = true
+			b.WriteString(headers[h.File])
+		}
+		b.WriteString(h.Text)
+	}
+	return b.String()
+}
+
+// fileHeaders returns each file's diff header — everything from "diff --git"
+// up to its first hunk.
+func fileHeaders(raw string) map[string]string {
+	out := make(map[string]string)
+	var file string
+	var b strings.Builder
+	flush := func() {
+		if file != "" {
+			out[file] = b.String()
+		}
+		b.Reset()
+	}
+	inHeader := false
+	for _, line := range strings.Split(raw, "\n") {
+		switch {
+		case strings.HasPrefix(line, "diff --git "):
+			flush()
+			file = diffFilePath(line)
+			inHeader = true
+			b.WriteString(line)
+			b.WriteByte('\n')
+		case strings.HasPrefix(line, "@@ "):
+			inHeader = false
+		case inHeader:
+			b.WriteString(line)
+			b.WriteByte('\n')
+		}
+	}
+	flush()
+	return out
 }

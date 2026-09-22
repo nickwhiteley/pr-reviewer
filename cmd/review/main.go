@@ -80,9 +80,9 @@ func main() {
 	if *model == "" {
 		switch *providerName {
 		case "anthropic":
-			*model = "claude-sonnet-4-6"
+			*model = provider.AnthropicDefaultModel
 		default:
-			*model = "kimi-k2.6:cloud"
+			*model = "glm-5.3-flash"
 		}
 	}
 
@@ -125,7 +125,7 @@ func main() {
 	}
 
 	// Compute diff
-	prDiff, err := diff.Compute(ctx, *base, *head)
+	prDiff, err := diff.Compute(ctx, *base, *head, cfg.ExcludedPaths)
 	if err != nil {
 		slog.Error("failed to compute diff", "error", err)
 		os.Exit(1)
@@ -169,30 +169,20 @@ func main() {
 
 	// Size the prompt sections against what the chosen model can actually
 	// accept, then chunk the diff to fit. diff.Compute returns the full diff,
-	// untruncated, and chunking now covers all of it: there is no cap on
-	// chunk count and no per-file byte cutoff, so nothing is dropped from the
-	// review. Wall-clock cost is controlled by running chunks concurrently
-	// (see the worker pool below) rather than by discarding content.
+	// untruncated, and chunking covers all of it: there is no cap on chunk
+	// count and no per-file byte cutoff, so nothing is dropped from an
+	// agent's review. Wall-clock cost is controlled by running chunks
+	// concurrently (see the worker pool below) and by giving each agent only
+	// the files it reviews (see agentWork), rather than by discarding content.
 	budget := newPromptBudget(p.PromptBudgetBytes(*model))
 	if *maxChunkBytes > 0 {
 		budget.chunk = *maxChunkBytes
 	}
 
-	diffChunks := diff.Chunk(prDiff, budget.chunk)
-	slog.Info("diff chunked", "chunks", len(diffChunks), "diff_bytes", len(prDiff),
-		"chunk_ceiling", budget.chunk)
-	for i, c := range diffChunks {
-		slog.Debug("chunk size", "chunk", i, "bytes", len(c))
-	}
-
-	// The full content of each chunk's changed files, built ONCE per chunk
-	// and shared by every agent. This used to be rebuilt inside each agent's
-	// loop, re-reading the same files off disk once per agent per chunk.
-	chunkFileContext := make([]string, len(diffChunks))
-	if *fileContext {
-		for i, c := range diffChunks {
-			chunkFileContext[i] = buildFileContext(diff.FilePaths(c), budget.fileContext)
-		}
+	work := planWork(cfg, prDiff, budget, *fileContext)
+	for i, w := range work {
+		slog.Info("agent diff", "subagent", cfg.Agents[i].Subagent, "chunks", len(w.chunks),
+			"diff_bytes", len(w.diff), "scoped", len(cfg.Agents[i].Paths) > 0)
 	}
 
 	// Fetch existing PR comments once, up front, so each agent can see its
@@ -296,11 +286,20 @@ func main() {
 	// …) rather than agent-major. If the budget does run out, coverage then
 	// degrades uniformly — all agents have seen the same early chunks —
 	// instead of leaving the last agent with nothing reviewed at all.
-	type work struct{ agent, chunk int }
-	var queue []work
-	for c := range diffChunks {
+	// Agents now have different chunk counts, because each is chunked from
+	// its own scoped diff, so a round simply skips the agents that have
+	// already finished rather than assuming a rectangular grid.
+	type job struct{ agent, chunk int }
+	var queue []job
+	maxChunks := 0
+	for _, w := range work {
+		maxChunks = max(maxChunks, len(w.chunks))
+	}
+	for c := range maxChunks {
 		for a := range cfg.Agents {
-			queue = append(queue, work{a, c})
+			if c < len(work[a].chunks) {
+				queue = append(queue, job{a, c})
+			}
 		}
 	}
 
@@ -312,38 +311,38 @@ func main() {
 	}
 
 	var mu sync.Mutex
-	jobs := make(chan work)
-	workers := min(*concurrency, len(queue))
+	jobs := make(chan job)
+	workers := min(*concurrency, max(len(queue), 1))
 
-	slog.Info("scheduling review", "agents", len(cfg.Agents), "chunks", len(diffChunks),
-		"calls", len(queue), "workers", workers, "provider", *providerName, "model", *model)
+	slog.Info("scheduling review", "agents", len(cfg.Agents), "calls", len(queue),
+		"workers", workers, "provider", *providerName, "model", *model)
 
 	var wg sync.WaitGroup
 	for range workers {
 		wg.Go(func() {
-			for w := range jobs {
+			for j := range jobs {
 				if reviewCtx.Err() != nil {
 					return
 				}
-				res := runChunk(reviewCtx, p, *model, basePrompt, cfg.Agents[w.agent], chunkInput{
-					diff:        diffChunks[w.chunk],
-					fileContext: chunkFileContext[w.chunk],
-					index:       w.chunk,
-					total:       len(diffChunks),
-					previous:    previousReports[w.agent],
-				}, *verify)
+				res := runChunk(reviewCtx, p, *model, basePrompt, cfg.Agents[j.agent], chunkInput{
+					diff:        work[j.agent].chunks[j.chunk],
+					fileContext: work[j.agent].fileCtx[j.chunk],
+					index:       j.chunk,
+					total:       len(work[j.agent].chunks),
+					previous:    previousReports[j.agent],
+				})
 
 				mu.Lock()
-				outcomes[w.agent].merge(w.chunk, res)
+				outcomes[j.agent].merge(j.chunk, res)
 				mu.Unlock()
 			}
 		})
 	}
 
 dispatch:
-	for _, w := range queue {
+	for _, j := range queue {
 		select {
-		case jobs <- w:
+		case jobs <- j:
 		case <-reviewCtx.Done():
 			break dispatch
 		}
@@ -351,7 +350,26 @@ dispatch:
 	close(jobs)
 	wg.Wait()
 
+	// Verification runs here, after the grid, as ONE call per agent over all
+	// of that agent's gating findings — not one per chunk inside runChunk.
+	//
+	// Per-chunk verification cost a second serial round-trip for every chunk
+	// that found anything, on the critical path of the worker holding it, and
+	// re-sent the whole 120KB chunk to re-examine three findings. Batching
+	// turns up to one-call-per-chunk-per-agent into one-per-agent, and
+	// diff.EvidenceFor sends only the hunks the findings actually point at.
+	//
+	// Whether the REVIEW ran out of time is decided here, before the
+	// verification pass, and not re-read afterwards. Verification is a
+	// refinement of a review that has already happened: if it is what
+	// overruns the deadline, the right report is a complete review whose
+	// gating findings say they were not re-checked — not a timeout notice
+	// claiming the PR was never looked at.
 	timedOut := errors.Is(reviewCtx.Err(), context.DeadlineExceeded)
+
+	if *verify && !timedOut {
+		runVerification(reviewCtx, p, *model, cfg.Agents, work, outcomes, *concurrency)
+	}
 
 	// Publish whatever each agent managed to collect, even on timeout. The
 	// previous behaviour discarded every finding an agent had already
@@ -365,6 +383,18 @@ dispatch:
 	for i, agent := range cfg.Agents {
 		out := &outcomes[i]
 		out.finalize(*verify)
+
+		// An agent scoped to paths this PR does not touch has nothing to do.
+		// That is a complete review of an empty set, not a failure: saying so
+		// is the honest report, and counting it as a failure would fail the
+		// check on every PR that happens to miss one agent's area.
+		if len(work[i].chunks) == 0 {
+			marker := fmt.Sprintf("<!-- wd-auto-review:agent=%s -->", agent.Subagent)
+			if postErr := sink.PostOrUpdate(ctx, *prNum, marker, review.FormatOutOfScopeReport(agent)); postErr != nil {
+				slog.Error("failed to post out-of-scope comment", "subagent", agent.Subagent, "error", postErr)
+			}
+			continue
+		}
 
 		// An agent that completed nothing has no findings worth posting; it
 		// gets a failure comment instead. On timeout the single timeout
@@ -388,7 +418,7 @@ dispatch:
 		if out.summary.Critical > 0 || out.summary.High > 0 {
 			hasCriticalOrHigh = true
 		}
-		unreviewed := out.unreviewedFiles(diffChunks)
+		unreviewed := out.unreviewedFiles(work[i].chunks)
 		if len(unreviewed) > 0 || out.parseFailures > 0 {
 			partialAgents++
 		}
@@ -402,7 +432,7 @@ dispatch:
 			fmt.Fprintf(&body,
 				"\n\n---\n\n⚠️ **Results could not be parsed for %d of %d chunk(s)** — any findings there are "+
 					"shown as raw output above but are NOT reflected in the severity summary. Treat this review as incomplete.\n",
-				out.parseFailures, len(diffChunks),
+				out.parseFailures, len(work[i].chunks),
 			)
 		}
 		if *verify && out.unverifiedFindings > 0 {
@@ -410,6 +440,11 @@ dispatch:
 				"\n\n---\n\nℹ️ %d medium/low finding(s) were published without a verification pass. "+
 					"Verification runs on critical/high findings — the ones that gate this check — to keep the "+
 					"review inside its time budget.\n", out.unverifiedFindings)
+		}
+		if *verify && !out.verified && out.summary.Critical+out.summary.High > 0 {
+			body.WriteString(
+				"\n\n---\n\n⚠️ The verification pass did not run for this agent, so the critical/high " +
+					"findings above are first-draft results that have not been re-checked against the diff.\n")
 		}
 		body.WriteString(formatCoverageNote(unreviewed, timedOut))
 
@@ -510,9 +545,125 @@ type promptBudget struct {
 
 func newPromptBudget(total int) promptBudget {
 	return promptBudget{
-		chunk:       min(max(total*60/100, diff.MinChunkSize), diff.MaxChunkSize),
-		fileContext: min(total*25/100, maxFileContextBytes),
+		chunk: min(max(total*60/100, diff.MinChunkSize), diff.MaxChunkSize),
+		// A tenth, not a quarter. The file-context section shows a window
+		// around each hunk now rather than whole files (see buildFileContext),
+		// so it needs far less room — and it was the single largest avoidable
+		// share of every prompt when it did not.
+		fileContext: min(total*10/100, maxFileContextBytes),
 	}
+}
+
+// agentWork is one agent's share of the review: the diff it is scoped to,
+// chunked to fit the model, with the file context for each chunk.
+type agentWork struct {
+	diff    string
+	chunks  []string
+	fileCtx []string
+}
+
+// planWork scopes the diff to each agent's paths and chunks what is left.
+//
+// The order matters: filter first, chunk second. Chunking the whole PR and
+// then handing every chunk to every agent is what made review time scale
+// with agents × chunks — a database agent scoped to the store package was
+// still being sent, and still paying to read, every Svelte component in the
+// PR. Filtering first means it gets one small chunk instead of seven large
+// ones, and the grid shrinks by roughly the amount of each agent's diff that
+// was never its business.
+//
+// An agent with no Paths keeps the old behaviour and sees everything.
+func planWork(cfg *config.Config, prDiff string, budget promptBudget, withFileContext bool) []agentWork {
+	work := make([]agentWork, len(cfg.Agents))
+	for i, agent := range cfg.Agents {
+		d := prDiff
+		if include, exclude := agent.Scope(); len(include)+len(exclude) > 0 {
+			d = diff.Filter(prDiff, include, exclude)
+		}
+		if strings.TrimSpace(d) == "" {
+			continue // nothing in this agent's scope; reported as such
+		}
+		work[i].diff = d
+		work[i].chunks = diff.Chunk(d, budget.chunk)
+		work[i].fileCtx = make([]string, len(work[i].chunks))
+		if withFileContext {
+			for j, c := range work[i].chunks {
+				work[i].fileCtx[j] = buildFileContext(c, budget.fileContext)
+			}
+		}
+	}
+	return work
+}
+
+// runVerification re-examines each agent's gating findings in one call per
+// agent, replacing its findings with the survivors. Agents are verified
+// concurrently under the same call budget as the review grid.
+//
+// A failure here is never fatal: the findings are published unverified and
+// the report says so, which is the same trade the per-chunk pass made.
+func runVerification(ctx context.Context, p provider.Provider, model string, agents []config.AgentConfig, work []agentWork, outcomes []agentOutcome, concurrency int) {
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+
+	for i := range agents {
+		out := &outcomes[i]
+		out.findings = review.DedupeFindings(out.findings)
+		gating, advisory := partitionGating(out.findings)
+		if len(gating) == 0 {
+			out.verified = true // nothing to verify is a completed verification
+			continue
+		}
+
+		wg.Go(func() {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if ctx.Err() != nil {
+				return
+			}
+
+			evidence := evidenceFor(work[i].diff, gating)
+			verified, dismissed, err := verifyFindings(ctx, p, model, agents[i], evidence, gating)
+			if err != nil {
+				slog.Warn("verification pass failed; keeping unverified findings",
+					"subagent", agents[i].Subagent, "error", err)
+				return
+			}
+			slog.Info("verification pass", "subagent", agents[i].Subagent,
+				"draft", len(gating), "kept", len(verified), "dismissed", len(dismissed))
+			out.findings = append(verified, advisory...)
+			out.dismissed = append(out.dismissed, dismissed...)
+			out.verified = true
+		})
+	}
+	wg.Wait()
+}
+
+// evidenceFor returns the slice of an agent's diff that its findings point
+// at: the hunks covering their lines, or — when no finding anchors to a hunk,
+// which happens when a model reports a line just outside one — the whole of
+// each named file, so verification still has something to judge against
+// rather than dismissing everything for want of evidence.
+func evidenceFor(agentDiff string, findings []review.Finding) string {
+	locations := make(map[string][]int)
+	var files []string
+	seen := make(map[string]bool)
+	for _, f := range findings {
+		if f.File == "" {
+			continue
+		}
+		locations[f.File] = append(locations[f.File], f.Line)
+		if !seen[f.File] {
+			seen[f.File] = true
+			files = append(files, f.File)
+		}
+	}
+	if ev := diff.EvidenceFor(agentDiff, locations); strings.TrimSpace(ev) != "" {
+		return ev
+	}
+	if len(files) > 0 {
+		return diff.Filter(agentDiff, files, nil)
+	}
+	return agentDiff
 }
 
 // agentOutcome is the combined result of one agent across all diff chunks.
@@ -539,6 +690,11 @@ type agentOutcome struct {
 	// verification pass because they were below the gating severity. Set by
 	// finalize, after dedupe, so it matches what the reader actually sees.
 	unverifiedFindings int
+	// verified records that the verification pass ran to completion for this
+	// agent. False after a provider error or a timeout that cut the pass
+	// short, which the report states rather than implying the gating
+	// findings were re-checked when they were not.
+	verified bool
 	// err is the first hard error seen; only reported when nothing completed.
 	err error
 }
@@ -629,10 +785,11 @@ type chunkInput struct {
 	previous    string
 }
 
-// runChunk performs one agent's review of one diff chunk: the review call,
-// plus a verification call when the chunk produced findings that would gate
-// the check.
-func runChunk(ctx context.Context, p provider.Provider, model string, base review.PromptInput, agent config.AgentConfig, c chunkInput, verify bool) chunkResult {
+// runChunk performs one agent's review of one diff chunk. Verification is
+// NOT done here: it is batched per agent once the whole grid has run (see
+// runVerification), so it costs one call per agent rather than one per chunk
+// and does not sit on the critical path of the worker that found something.
+func runChunk(ctx context.Context, p provider.Provider, model string, base review.PromptInput, agent config.AgentConfig, c chunkInput) chunkResult {
 	slog.Info("agent chunk", "subagent", agent.Subagent, "chunk", c.index+1, "total", c.total)
 
 	in := base
@@ -663,29 +820,7 @@ func runChunk(ctx context.Context, p provider.Provider, model string, base revie
 		return res
 	}
 
-	res := chunkResult{notes: notes}
-
-	// Verify only the findings that actually gate this check. The pass costs
-	// a full extra provider round-trip per chunk, and its value is filtering
-	// false positives out of results that fail CI — medium and low findings
-	// are advisory, so paying to re-examine them doubles review time for no
-	// change in outcome. They are published marked as unverified.
-	gating, advisory := partitionGating(findings)
-	if verify && len(gating) > 0 {
-		verified, dismissed, verr := verifyFindings(ctx, p, model, agent, c.diff, gating)
-		if verr != nil {
-			slog.Warn("verification pass failed; keeping unverified findings",
-				"subagent", agent.Subagent, "chunk", c.index+1, "error", verr)
-		} else {
-			slog.Info("verification pass", "subagent", agent.Subagent, "chunk", c.index+1,
-				"draft", len(gating), "kept", len(verified), "dismissed", len(dismissed))
-			gating = verified
-			res.dismissed = dismissed
-		}
-	}
-
-	res.findings = append(gating, advisory...)
-	return res
+	return chunkResult{notes: notes, findings: findings}
 }
 
 // partitionGating splits findings into those that fail the check

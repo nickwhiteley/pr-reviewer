@@ -150,3 +150,30 @@ func TestParseSeverity_extraText(t *testing.T) {
 		t.Errorf("expected high=1, got %d", summary.High)
 	}
 }
+
+// A scoped agent must be told its diff is a subset, or the standing
+// "absence is not evidence" discipline gets applied to a filter artefact.
+func TestBuildPrompt_scopeNote(t *testing.T) {
+	cfg := &config.Config{Owner: "n", Context: "c", ProductionStatus: "p", SecurityLevel: "s"}
+
+	scoped := BuildPrompt(PromptInput{
+		Cfg:   cfg,
+		Agent: config.AgentConfig{Subagent: "postgres-pro", Paths: []string{"api/internal/store/"}},
+		Diff:  "d",
+	})
+	if !strings.Contains(scoped, "api/internal/store/") {
+		t.Errorf("scope note missing the agent's paths:\n%s", scoped)
+	}
+	if !strings.Contains(scoped, "outside your scope than absent") {
+		t.Errorf("scope note missing its warning:\n%s", scoped)
+	}
+
+	unscoped := BuildPrompt(PromptInput{
+		Cfg:   cfg,
+		Agent: config.AgentConfig{Subagent: "code-reviewer"},
+		Diff:  "d",
+	})
+	if strings.Contains(unscoped, "**Scope**") {
+		t.Error("an unscoped agent must get no scope note")
+	}
+}

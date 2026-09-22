@@ -53,7 +53,7 @@ func TestCompute(t *testing.T) {
 	os.Chdir(dir)
 	defer os.Chdir(wd)
 
-	d, err := Compute(ctx, baseSHA, headSHA)
+	d, err := Compute(ctx, baseSHA, headSHA, nil)
 	if err != nil {
 		t.Fatalf("Compute error: %v", err)
 	}
@@ -71,7 +71,7 @@ func TestFilterDiff_exclusions(t *testing.T) {
 diff --git a/src/main.go b/src/main.go
 +package main
 `
-	filtered := filterDiff(raw)
+	filtered := Filter(raw, nil, DefaultExclusions)
 	if contains(filtered, "vendor/lib.go") {
 		t.Error("vendor path should be excluded")
 	}
@@ -135,7 +135,7 @@ func TestCompute_noWholeDiffTruncation(t *testing.T) {
 	os.Chdir(dir)
 	defer os.Chdir(wd)
 
-	d, err := Compute(ctx, baseSHA, headSHA)
+	d, err := Compute(ctx, baseSHA, headSHA, nil)
 	if err != nil {
 		t.Fatalf("Compute error: %v", err)
 	}
@@ -382,8 +382,8 @@ func TestExcluded(t *testing.T) {
 		{"main.go", false},
 	}
 	for _, tc := range cases {
-		if got := excluded(tc.path); got != tc.want {
-			t.Errorf("excluded(%q) = %v, want %v", tc.path, got, tc.want)
+		if got := Match(tc.path, DefaultExclusions); got != tc.want {
+			t.Errorf("Match(%q, DefaultExclusions) = %v, want %v", tc.path, got, tc.want)
 		}
 	}
 }
@@ -478,5 +478,121 @@ func TestNewSideLines_noNewlineMarkerMidHunk(t *testing.T) {
 		if !lines["f.txt"][n] {
 			t.Errorf("f.txt:%d should be valid despite mid-hunk no-newline marker", n)
 		}
+	}
+}
+
+func TestFilter_include(t *testing.T) {
+	raw := `diff --git a/api/internal/store/pg.go b/api/internal/store/pg.go
++func SaveHead() {}
+diff --git a/web/src/App.svelte b/web/src/App.svelte
++<div/>
+diff --git a/api/internal/db/0001.up.sql b/api/internal/db/0001.up.sql
++CREATE TABLE t();
+`
+	got := Filter(raw, []string{"api/internal/store/", "*.sql"}, nil)
+	if !contains(got, "store/pg.go") {
+		t.Error("included directory pattern was dropped")
+	}
+	if !contains(got, "0001.up.sql") {
+		t.Error("included basename glob was dropped")
+	}
+	if contains(got, "App.svelte") {
+		t.Error("file outside the include patterns was kept")
+	}
+}
+
+func TestFilter_includeWinsNothingWhenEmpty(t *testing.T) {
+	raw := "diff --git a/a.go b/a.go\n+x\n"
+	if got := Filter(raw, nil, nil); strings.TrimRight(got, "\n") != strings.TrimRight(raw, "\n") {
+		t.Errorf("an empty include list must keep everything, got %q", got)
+	}
+}
+
+func TestMatch_patternForms(t *testing.T) {
+	cases := []struct {
+		path, pattern string
+		want          bool
+	}{
+		{"api/internal/store/pg.go", "api/internal/store/", true},
+		{"api/internal/store/pg.go", "api/internal/store/**", true},
+		{"redist/x.go", "dist/", false},
+		{"a/dist/x.go", "dist/", true},
+		{"web/src/lib/server/auth.ts", "web/src/lib/server/*.ts", true},
+		{"web/src/lib/server/deep/auth.ts", "web/src/lib/server/*.ts", false},
+		{"migrations/0001.sql", "*.sql", true},
+		{"spec.md", "spec.md", true},
+		{"docs/spec.md", "spec.md", true},
+		{"anything.go", "", false},
+	}
+	for _, tc := range cases {
+		if got := Match(tc.path, []string{tc.pattern}); got != tc.want {
+			t.Errorf("Match(%q, %q) = %v, want %v", tc.path, tc.pattern, got, tc.want)
+		}
+	}
+}
+
+func TestHunks_ranges(t *testing.T) {
+	raw := `diff --git a/a.go b/a.go
+--- a/a.go
++++ b/a.go
+@@ -1,3 +10,4 @@
+ ctx
++added
+@@ -50,0 +80,2 @@
++one
++two
+`
+	hs := Hunks(raw)
+	if len(hs) != 2 {
+		t.Fatalf("got %d hunks, want 2", len(hs))
+	}
+	if hs[0].File != "a.go" || hs[0].Start != 10 || hs[0].End != 13 {
+		t.Errorf("hunk 0 = %+v, want a.go 10-13", hs[0])
+	}
+	if hs[1].Start != 80 || hs[1].End != 81 {
+		t.Errorf("hunk 1 = %+v, want 80-81", hs[1])
+	}
+	if !contains(hs[1].Text, "+two") {
+		t.Errorf("hunk text missing its lines: %q", hs[1].Text)
+	}
+}
+
+// EvidenceFor must return only the hunks a finding points at, with the file
+// header intact so the result is still a readable diff.
+func TestEvidenceFor(t *testing.T) {
+	raw := `diff --git a/a.go b/a.go
+index 111..222 100644
+--- a/a.go
++++ b/a.go
+@@ -1,1 +10,1 @@
++relevant
+@@ -50,1 +80,1 @@
++irrelevant
+diff --git a/b.go b/b.go
+--- a/b.go
++++ b/b.go
+@@ -1,1 +1,1 @@
++other file
+`
+	got := EvidenceFor(raw, map[string][]int{"a.go": {10}})
+
+	if !contains(got, "+relevant") {
+		t.Errorf("evidence missing the hunk the finding points at: %q", got)
+	}
+	if contains(got, "+irrelevant") {
+		t.Error("evidence included a hunk no finding points at")
+	}
+	if contains(got, "other file") {
+		t.Error("evidence included an unrelated file")
+	}
+	if !contains(got, "diff --git a/a.go") || !contains(got, "+++ b/a.go") {
+		t.Errorf("evidence dropped the file header: %q", got)
+	}
+}
+
+func TestEvidenceFor_unanchoredLineYieldsNothing(t *testing.T) {
+	raw := "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1,1 +10,1 @@\n+x\n"
+	if got := EvidenceFor(raw, map[string][]int{"a.go": {9999}}); strings.TrimSpace(got) != "" {
+		t.Errorf("a line in no hunk must yield no evidence, got %q", got)
 	}
 }

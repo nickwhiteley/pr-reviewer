@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
+	"github.com/nickwhiteley/pr-reviewer/internal/diff"
 	"github.com/nickwhiteley/pr-reviewer/internal/github"
 )
 
@@ -14,9 +16,13 @@ const (
 	// bounded so a huge PR can't balloon every prompt.
 	maxDiscussionBytes  = 16 * 1024
 	maxCommentBytes     = 2 * 1024
-	maxFileBytes        = 24 * 1024
-	maxFileContextBytes = 96 * 1024
+	maxFileContextBytes = 32 * 1024
 	maxRepoTreeBytes    = 8 * 1024
+
+	// contextLines is how much source to show either side of a hunk. Wide
+	// enough to carry the enclosing function and its guard clauses, which is
+	// what the section exists for; the whole file is not.
+	contextLines = 60
 
 	// maxPreviousReportBytes bounds the agent's own prior report. It is
 	// quoted verbatim into every chunk prompt, and it grows with each re-run
@@ -78,22 +84,43 @@ func buildDiscussion(comments []github.Comment, reviewComments []github.ReviewCo
 	return strings.TrimSpace(b.String())
 }
 
-// buildFileContext reads the current (head) content of changed files from
-// the checked-out working tree, so agents see whole files instead of hunks.
-// Missing files (deleted in the PR), binaries, and budget overruns are
-// skipped or truncated with an explicit note — never silently.
+// buildFileContext shows the source around each hunk of a diff chunk, read
+// from the checked-out working tree (which is head).
 //
-// budget is the byte allowance for this section, derived from the model's
-// context window (see promptBudget) rather than fixed, so a model with a
-// small window doesn't get a prompt it will quietly truncate.
-func buildFileContext(paths []string, budget int) string {
+// It used to dump WHOLE files, in diff order, until a 96KB budget ran out.
+// On a large PR that meant the first four or five changed files arrived
+// complete and the remaining thirty arrived as a one-line "content omitted"
+// note — the agent got saturating detail about an arbitrary prefix of the
+// diff and nothing at all about the rest. Windowing on hunks inverts both
+// halves of that: every changed file gets context, and the context it gets
+// is the part a reviewer would actually read. The section is about a third
+// of its old size as a side effect, which is most of the point — it was
+// costing nearly as many prompt tokens as the diff itself.
+//
+// Excerpts carry real line numbers because findings must cite a new-side
+// line that appears in the diff, and an unnumbered excerpt left the model
+// counting lines by hand.
+func buildFileContext(chunk string, budget int) string {
+	ranges := hunkWindows(chunk)
+	paths := diff.FilePaths(chunk)
+	if len(paths) == 0 || budget <= 0 {
+		return ""
+	}
+
+	// An equal share each, so no file is starved by its position in the
+	// diff. Files that use less than their share hand the remainder on.
 	var b strings.Builder
 	var omitted []string
+	remaining := budget
+	left := len(paths)
 
 	for _, p := range paths {
-		if b.Len() >= budget {
-			omitted = append(omitted, p)
-			continue
+		share := remaining / max(left, 1)
+		left--
+
+		rs, ok := ranges[p]
+		if !ok {
+			continue // no hunks (binary, rename): the diff header says it all
 		}
 		data, err := os.ReadFile(p)
 		if err != nil {
@@ -102,20 +129,76 @@ func buildFileContext(paths []string, budget int) string {
 		if isBinary(data) {
 			continue
 		}
-		truncNote := ""
-		if len(data) > maxFileBytes {
-			data = data[:maxFileBytes]
-			truncNote = "\n… [file truncated for context]"
+		excerpt := excerptRanges(string(data), rs, share)
+		if excerpt == "" {
+			omitted = append(omitted, p)
+			continue
 		}
 		// Four-backtick fence so file contents containing ``` don't break out.
-		fmt.Fprintf(&b, "### `%s`\n\n````\n%s%s\n````\n\n", p, strings.TrimRight(string(data), "\n"), truncNote)
+		section := fmt.Sprintf("### `%s`\n\n````\n%s\n````\n\n", p, excerpt)
+		b.WriteString(section)
+		remaining -= len(section)
+		if remaining < 0 {
+			remaining = 0
+		}
 	}
 
 	if len(omitted) > 0 {
-		fmt.Fprintf(&b, "_Content omitted for %d more file(s) (context budget): %s_\n",
+		fmt.Fprintf(&b, "_Context omitted for %d file(s) (budget): %s_\n",
 			len(omitted), strings.Join(omitted, ", "))
 	}
 	return strings.TrimSpace(b.String())
+}
+
+// hunkWindows returns, per file, the line ranges to excerpt: each hunk
+// widened by contextLines on both sides, with overlaps merged so a file with
+// several nearby hunks is shown once rather than repeatedly.
+func hunkWindows(chunk string) map[string][][2]int {
+	out := make(map[string][][2]int)
+	for file, rs := range diff.HunkRanges(chunk) {
+		widened := make([][2]int, 0, len(rs))
+		for _, r := range rs {
+			widened = append(widened, [2]int{max(r[0]-contextLines, 1), r[1] + contextLines})
+		}
+		sort.Slice(widened, func(i, j int) bool { return widened[i][0] < widened[j][0] })
+
+		merged := widened[:0:0]
+		for _, r := range widened {
+			if n := len(merged); n > 0 && r[0] <= merged[n-1][1]+1 {
+				merged[n-1][1] = max(merged[n-1][1], r[1])
+				continue
+			}
+			merged = append(merged, r)
+		}
+		out[file] = merged
+	}
+	return out
+}
+
+// excerptRanges renders the given line ranges of a file with line numbers,
+// separated by an elision marker, stopping once budget bytes are used.
+func excerptRanges(content string, ranges [][2]int, budget int) string {
+	lines := strings.Split(content, "\n")
+	var b strings.Builder
+
+	for i, r := range ranges {
+		if b.Len() >= budget {
+			fmt.Fprintf(&b, "… [remaining context for this file omitted: budget]\n")
+			break
+		}
+		if i > 0 {
+			b.WriteString("…\n")
+		}
+		end := min(r[1], len(lines))
+		for n := r[0]; n <= end; n++ {
+			if b.Len() >= budget {
+				fmt.Fprintf(&b, "… [truncated at line %d: budget]\n", n)
+				break
+			}
+			fmt.Fprintf(&b, "%5d| %s\n", n, lines[n-1])
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // isBinary reports whether data looks like a binary file (NUL byte in the

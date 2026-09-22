@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/nickwhiteley/pr-reviewer/internal/config"
 )
@@ -64,7 +65,28 @@ func runCheckConfig(args []string) int {
 				extra = " — " + a.Additional
 			}
 			fmt.Printf("  - %s/%s%s\n", a.Plugin, a.Subagent, extra)
+			// Scoping decides what this agent is never shown, so it is worth
+			// printing plainly: a typo'd pattern is otherwise invisible until
+			// a PR comes back reviewed by fewer eyes than intended.
+			include, exclude := a.Scope()
+			switch {
+			case len(include) == 0 && len(exclude) == 0:
+				fmt.Printf("      scope: the whole diff\n")
+			default:
+				scope := "the whole diff"
+				if len(include) > 0 {
+					scope = strings.Join(include, ", ")
+				}
+				if len(exclude) > 0 {
+					scope += " (excluding " + strings.Join(exclude, ", ") + ")"
+				}
+				fmt.Printf("      scope: %s\n", scope)
+			}
 		}
+	}
+
+	if len(cfg.ExcludedPaths) > 0 {
+		fmt.Printf("\nExcluded from every agent: %s\n", strings.Join(cfg.ExcludedPaths, ", "))
 	}
 	return 0
 }

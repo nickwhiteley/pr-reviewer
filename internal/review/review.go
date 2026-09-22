@@ -46,8 +46,8 @@ type PromptInput struct {
 	// Discussion is human conversation on the PR (comments and review
 	// replies), so agents can honor explanations of intentional behavior.
 	Discussion string
-	// FileContext is the full content of changed files (up to a budget), so
-	// agents see the code around the hunks instead of guessing.
+	// FileContext is numbered source excerpts around each hunk (up to a
+	// budget), so agents see the code around the change instead of guessing.
 	FileContext string
 	// RepoTree is a listing of repository files, so "X doesn't exist" claims
 	// can be checked against reality.
@@ -133,6 +133,9 @@ func BuildPrompt(in PromptInput) string {
 	if in.Agent.Additional != "" {
 		fmt.Fprintf(&b, "**Additional Focus**: %s\n\n", in.Agent.Additional)
 	}
+	if note := ScopeNote(in.Agent); note != "" {
+		b.WriteString(note + "\n\n")
+	}
 
 	b.WriteString("## Diff\n\n```diff\n")
 	b.WriteString(in.Diff)
@@ -140,7 +143,10 @@ func BuildPrompt(in PromptInput) string {
 
 	if in.FileContext != "" {
 		b.WriteString("## Changed File Contents\n\n")
-		b.WriteString("The full current content of (some of) the files changed in this diff, for surrounding context — error handling, validation, or checks may live in parts of the file the diff doesn't show.\n\n")
+		b.WriteString(
+			"The current source around each change, read from the head commit and shown with its real line " +
+				"numbers. Lines outside these windows are not shown — error handling, validation or checks may " +
+				"live there, so their absence here is not evidence they are missing. `…` marks a gap.\n\n")
 		b.WriteString(in.FileContext)
 		b.WriteString("\n")
 	}
@@ -209,6 +215,26 @@ func ChunkNote(index, total int) string {
 	)
 }
 
+// ScopeNote tells an agent that the diff it has been given is the subset of
+// the pull request matching its configured paths, not the whole of it.
+//
+// Without this the scoping would quietly manufacture false positives: an
+// agent shown only the store package, and holding the standing instruction
+// that absent code is not evidence of missing code, would still reason about
+// "the handler that should validate this" as though its absence were a fact
+// about the PR. It is a fact about the filter.
+func ScopeNote(agent config.AgentConfig) string {
+	if len(agent.Paths) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(
+		"**Scope**: you have been given only the files in this pull request matching %s, because that is "+
+			"what your role reviews. The PR changes other files as well, reviewed by other roles. Never treat a "+
+			"file, function, test or check you cannot see as missing from the PR — it is far more likely to be "+
+			"outside your scope than absent.",
+		describeScope(agent))
+}
+
 // ParseSeverity extracts the severity JSON block from the response text.
 func ParseSeverity(text string) (SeveritySummary, string, error) {
 	// Look for JSON block in backticks or inline
@@ -249,6 +275,37 @@ func FormatAgentReport(agent config.AgentConfig, summary SeveritySummary, report
 
 	b.WriteString(fmt.Sprintf("<!-- wd-auto-review:agent=%s -->\n", agent.Subagent))
 	return b.String()
+}
+
+// FormatOutOfScopeReport returns a markdown comment for an agent whose
+// configured paths match nothing in this PR.
+//
+// This is deliberately not a failure and not a silent omission: the reader
+// needs to know the agent ran and had nothing to look at, so that an agent
+// missing from the PR entirely still reads as something to investigate.
+func FormatOutOfScopeReport(agent config.AgentConfig) string {
+	return fmt.Sprintf(
+		"## Code Review: %s\n\n**Severity Summary**: ✅ No issues found\n\n"+
+			"This agent reviews %s, and this pull request changes no such file. "+
+			"Nothing was sent for review.\n\n"+
+			"<!-- wd-auto-review:agent=%s -->\n",
+		agent.Subagent, describeScope(agent), agent.Subagent,
+	)
+}
+
+// describeScope renders an agent's Paths as prose, keeping the "!" negations
+// as an exclusion clause rather than listing them as though they were
+// included.
+func describeScope(agent config.AgentConfig) string {
+	include, exclude := agent.Scope()
+	desc := "the whole diff"
+	if len(include) > 0 {
+		desc = "`" + strings.Join(include, "`, `") + "`"
+	}
+	if len(exclude) > 0 {
+		desc += ", excluding `" + strings.Join(exclude, "`, `") + "`"
+	}
+	return desc
 }
 
 // FormatAgentFailureReport returns a markdown comment when an agent fails to run.

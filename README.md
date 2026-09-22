@@ -35,11 +35,13 @@ On timeout, whatever findings the agents had already produced are still posted, 
 
 Every chunk is a separate provider round-trip, so chunk count, not diff size, is what drives review time. Three things keep it bounded:
 
+- **Each agent is chunked from its own filtered diff.** The `Paths` column scopes an agent to the files it actually reviews, and the filtering happens *before* chunking — a database reviewer scoped to the store package gets one small chunk instead of every chunk of the PR. This is usually the largest single saving on a big PR; without it, review cost is agents × chunks no matter how narrow each role is.
 - **Chunks are sized from the model's context window**, not a fixed constant. Kimi K2.6's 262K-token window comfortably holds a 150 KB diff chunk plus file context, so most PRs are a single call per agent. A model with a smaller window automatically gets smaller chunks and less file context rather than a prompt the server would silently truncate.
 - **Agent×chunk pairs run through one shared worker pool.** Raising `--concurrency` shortens large reviews directly; lower it if you hit provider rate limits.
-- **Verification runs only on gating findings**, halving the call count on typical PRs.
+- **File context is a window around each hunk**, not the whole file — roughly a third of the tokens, spread evenly over every changed file instead of dumping the first few in full and omitting the rest.
+- **Verification is one call per agent**, batched after the review grid and given only the hunks its findings point at, rather than one call per chunk carrying the whole chunk.
 
-Nothing is dropped to save time: the whole diff is always chunked and reviewed, oversized files are split at hunk boundaries rather than truncated, and if the budget runs out the report says which files it missed. If reviews still time out, raise `--review-timeout` and `--concurrency` before considering `--verify=false` or `--file-context=false`.
+Nothing is dropped to save time: every file in an agent's scope is chunked and reviewed, oversized files are split at hunk boundaries rather than truncated, and if the budget runs out the report says which files it missed. An agent whose paths match nothing in a PR reports that plainly and does not fail the check. If reviews still time out, widen `--review-timeout`, raise `--concurrency`, or narrow the `Paths` columns before considering `--verify=false` or `--file-context=false`.
 
 ---
 
@@ -103,11 +105,11 @@ Run `check-config` in CI (or a pre-commit hook) on repos that edit their `PR-REV
 | `--head` | required | Head commit SHA |
 | `--config` | `PR-REVIEW.md` | Path to the config file |
 | `--provider` | `ollama` | AI provider: `ollama` or `anthropic` |
-| `--model` | provider default | Model name (`kimi-k2.6:cloud` / `claude-sonnet-4-6`) |
+| `--model` | provider default | Model name (`kimi-k2.6:cloud` / `claude-sonnet-5`) |
 | `--fail-mode` | `closed` | `closed`: failures/timeouts/unparseable results fail the check; `open`: advisory |
 | `--verify` | true | Second-pass verification of each agent's findings |
 | `--inline-comments` | true | Post findings as inline review comments on diff lines |
-| `--file-context` | true | Include full changed-file contents (budgeted) in prompts |
+| `--file-context` | true | Include source around each hunk (budgeted) in prompts |
 | `--review-timeout` | 600 | Seconds allowed for the AI review phase (0 = unlimited) |
 | `--concurrency` | 6 | Maximum provider calls in flight at once, across all agents and chunks |
 | `--max-chunk-bytes` | 0 | Override the per-chunk diff byte ceiling (0 = derive from the model's context window) |
@@ -188,15 +190,51 @@ Configure agents as a Markdown table. Each row is one agent invocation.
 
 ```markdown
 ## Code Reviews
-| Plugin | Subagent | Additional |
-| voltagent-qa-sec | architect-reviewer | |
-| voltagent-qa-sec | penetration-tester | focus on input validation |
-| voltagent-data-ai | database-optimizer | |
+| Plugin | Subagent | Paths | Additional |
+| voltagent-qa-sec | architect-reviewer | | |
+| voltagent-qa-sec | penetration-tester | `api/`, `!*_test.go` | focus on input validation |
+| voltagent-data-ai | database-optimizer | `internal/store/`, `*.sql` | |
 ```
 
 **Plugin**: the agent plugin namespace (used in the system prompt).  
 **Subagent**: the specific reviewer role within the plugin.  
+**Paths**: optional file patterns scoping what this agent reviews — see below.  
 **Additional**: optional extra instructions appended to that agent's prompt.
+
+Columns are matched by **header name**, not position, so the order is free and
+a table without a `Paths` column keeps working unchanged.
+
+#### Scoping agents with `Paths`
+
+An empty `Paths` cell means the whole diff. Otherwise the agent is sent only
+the matching files, chunked on its own, and its prompt says so — an agent must
+know it is seeing a subset, or it will report code it cannot see as missing.
+
+Patterns are comma- or space-separated, and a leading `!` subtracts:
+
+| Pattern | Matches |
+| ------- | ------- |
+| `internal/store/` or `internal/store/**` | that directory, at any depth |
+| `web/src/lib/server/*.ts` | a path glob (contains `/`) |
+| `*.sql` | a basename glob |
+| `spec.md` | that exact path, or that basename anywhere |
+| `!*_test.go` | subtracted from whatever the other patterns matched |
+
+Scoping is a real trade: what an agent is not sent, it cannot find. Keep at
+least one agent unscoped so every changed file is read by somebody, and use
+`review check-config` to print each agent's resolved scope before relying on it.
+
+#### Excluding paths repository-wide
+
+```markdown
+## Excluded Paths
+- `PROGRESS.md`
+- `generated/`
+```
+
+Kept out of every agent's diff, on top of the built-in defaults (vendored
+trees, lockfiles, generated code, `CLAUDE.md`, `PR-REVIEW.md`). Same pattern
+vocabulary, without `!`.
 
 ---
 

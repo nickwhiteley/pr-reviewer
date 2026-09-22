@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/nickwhiteley/pr-reviewer/internal/config"
 	"github.com/nickwhiteley/pr-reviewer/internal/diff"
 	"github.com/nickwhiteley/pr-reviewer/internal/review"
 )
@@ -138,5 +139,79 @@ func TestFormatCoverageNote(t *testing.T) {
 	long := formatCoverageNote(many, false)
 	if !strings.Contains(long, "and 60 more") {
 		t.Errorf("long file lists must be elided: %q", long)
+	}
+}
+
+// planWork is the whole point of routing: each agent must be chunked from
+// its own filtered diff, not handed chunks of the whole PR.
+func TestPlanWork_scopesEachAgent(t *testing.T) {
+	prDiff := "diff --git a/api/internal/store/pg.go b/api/internal/store/pg.go\n" +
+		"--- a/api/internal/store/pg.go\n+++ b/api/internal/store/pg.go\n@@ -1,1 +1,1 @@\n+store\n" +
+		"diff --git a/web/src/App.svelte b/web/src/App.svelte\n" +
+		"--- a/web/src/App.svelte\n+++ b/web/src/App.svelte\n@@ -1,1 +1,1 @@\n+web\n"
+
+	cfg := &config.Config{Agents: []config.AgentConfig{
+		{Subagent: "postgres-pro", Paths: []string{"api/internal/store/"}},
+		{Subagent: "code-reviewer"},
+		{Subagent: "accessibility", Paths: []string{"nothing/matches/"}},
+	}}
+
+	work := planWork(cfg, prDiff, promptBudget{chunk: 1 << 20}, false)
+
+	if strings.Contains(work[0].diff, "App.svelte") {
+		t.Error("a scoped agent was given a file outside its paths")
+	}
+	if !strings.Contains(work[0].diff, "store/pg.go") {
+		t.Error("a scoped agent lost the file it is scoped to")
+	}
+	if !strings.Contains(work[1].diff, "App.svelte") || !strings.Contains(work[1].diff, "store/pg.go") {
+		t.Error("an unscoped agent must still see the whole diff")
+	}
+	if len(work[2].chunks) != 0 {
+		t.Errorf("an agent matching nothing must get no chunks, got %d", len(work[2].chunks))
+	}
+}
+
+// An agent that matches nothing is reported as out of scope rather than
+// counted a failure — otherwise every PR that misses one agent's area would
+// fail the check.
+func TestOutOfScopeReportIsNotAFailure(t *testing.T) {
+	body := review.FormatOutOfScopeReport(config.AgentConfig{
+		Subagent: "postgres-pro", Paths: []string{"api/internal/store/"},
+	})
+	if !strings.Contains(body, "No issues found") {
+		t.Errorf("out-of-scope report must not read as a failure: %q", body)
+	}
+	if !strings.Contains(body, "api/internal/store/") {
+		t.Errorf("out-of-scope report must name the scope: %q", body)
+	}
+}
+
+// Findings are verified against the hunks they point at, not the whole diff.
+func TestEvidenceFor_narrowsToFindingHunks(t *testing.T) {
+	agentDiff := "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n" +
+		"@@ -1,1 +5,1 @@\n+suspect\n@@ -40,1 +90,1 @@\n+unrelated\n"
+
+	got := evidenceFor(agentDiff, []review.Finding{{File: "a.go", Line: 5}})
+	if !strings.Contains(got, "+suspect") {
+		t.Errorf("evidence lost the hunk under review: %q", got)
+	}
+	if strings.Contains(got, "+unrelated") {
+		t.Errorf("evidence should not carry hunks no finding points at: %q", got)
+	}
+}
+
+// A line number just outside every hunk must not leave verification with
+// nothing to judge — it falls back to the named file.
+func TestEvidenceFor_fallsBackToNamedFile(t *testing.T) {
+	agentDiff := "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1,1 +5,1 @@\n+suspect\n" +
+		"diff --git a/b.go b/b.go\n--- a/b.go\n+++ b/b.go\n@@ -1,1 +1,1 @@\n+other\n"
+
+	got := evidenceFor(agentDiff, []review.Finding{{File: "a.go", Line: 9999}})
+	if !strings.Contains(got, "+suspect") {
+		t.Errorf("fallback must include the named file: %q", got)
+	}
+	if strings.Contains(got, "+other") {
+		t.Errorf("fallback must not include files no finding names: %q", got)
 	}
 }

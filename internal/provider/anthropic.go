@@ -16,18 +16,57 @@ import (
 const (
 	anthropicEndpoint = "https://api.anthropic.com/v1/messages"
 	anthropicVersion  = "2023-06-01"
-	anthropicModel    = "claude-sonnet-4-6"
 
-	// anthropicContextTokens is the standard Claude context window.
-	anthropicContextTokens = 200000
+	// AnthropicDefaultModel is the model used when --model names none. Exported
+	// so the pin lives in one place: main.go used to carry a second copy of it,
+	// and the two drifted.
+	AnthropicDefaultModel = "claude-sonnet-5"
+
 	// anthropicMaxTokens is the response cap; keep it and ResponseTokens in
 	// step so the prompt budget reserves what the response may actually use.
-	anthropicMaxTokens = 8192
+	anthropicMaxTokens = 16384
 )
 
+// anthropicContextTokens is the context window, in tokens, of models we know
+// about — the same shape the Ollama provider uses, and for the same reason:
+// one constant cannot describe a lineup where Haiku is 200K and everything
+// above it is 1M. The single 200000 that used to sit here was the Claude 3
+// era, and it chunked every review about five times more finely than the
+// window needed.
+var anthropicContextTokens = map[string]int{
+	"claude-opus-5":     1000000,
+	"claude-sonnet-5":   1000000,
+	"claude-sonnet-4-6": 1000000,
+	"claude-haiku-4-5":  200000,
+}
+
+// anthropicDefaultContextTokens is the assumed window for an unrecognised
+// model. Deliberately modest, matching the Ollama provider's reasoning:
+// guessing low costs an extra chunk, guessing high invites a silently
+// truncated prompt.
+const anthropicDefaultContextTokens = 200000
+
+// contextTokensFor returns the context window for a model, ignoring any
+// dated-snapshot suffix if the exact name isn't known.
+func contextTokensFor(model string) int {
+	if model == "" {
+		model = AnthropicDefaultModel
+	}
+	if n, ok := anthropicContextTokens[model]; ok {
+		return n
+	}
+	// "claude-haiku-4-5-20251001" and the like resolve to their base name.
+	for base, n := range anthropicContextTokens {
+		if strings.HasPrefix(model, base+"-") {
+			return n
+		}
+	}
+	return anthropicDefaultContextTokens
+}
+
 // PromptBudgetBytes implements Provider.
-func (a *AnthropicProvider) PromptBudgetBytes(string) int {
-	return (anthropicContextTokens - anthropicMaxTokens) * BytesPerToken
+func (a *AnthropicProvider) PromptBudgetBytes(model string) int {
+	return (contextTokensFor(model) - anthropicMaxTokens) * BytesPerToken
 }
 
 // AnthropicProvider sends prompts to the Anthropic Messages API.
@@ -47,7 +86,7 @@ func NewAnthropicProvider() *AnthropicProvider {
 // Generate sends a prompt to the Anthropic Messages API and returns the response.
 func (a *AnthropicProvider) Generate(ctx context.Context, model string, prompt string) (Response, error) {
 	if model == "" {
-		model = anthropicModel
+		model = AnthropicDefaultModel
 	}
 
 	payload := map[string]any{
